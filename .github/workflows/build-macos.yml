@@ -1,0 +1,131 @@
+# Release build for aarch64-apple-darwin, native on the arm64 runner — manual, or
+# called by release.yml.
+#
+# IDEA. This repository's merge gate is local `make ci` (CONTRIBUTING.md) and that has
+# not changed: this workflow never runs on a push or a pull request, blocks nothing, and
+# is required by no branch rule. It runs two ways — a manual workflow_dispatch, and a
+# workflow_call from release.yml, which hands it the version and the exact commit to
+# build. It exists for the two things a laptop cannot give you — proof that a target
+# still compiles from a *clean* checkout, and a downloadable build for a platform you
+# do not own. macOS is the sharpest case of that second point: this
+# is the only routine check that the cfg(target_os = "macos") code — the stuck-modifier
+# watchdog and its objc2-app-kit dependency (client/Cargo.toml) — still builds at all.
+#
+# macos-latest is arm64 (macos-14+), so this is a NATIVE build, not a cross-build, and
+# needs no extra toolchain or SDK setup. git, tar and zip are preinstalled.
+#
+# Dispatched by hand, the zip is a dev build and is named openroad-<version>-g<sha>-
+# <target> so it cannot be mistaken for a release. Called by release.yml it IS the
+# release artifact, openroad-<version>-<target> — unsigned and unnotarised either way.
+# The binary needs the user's own PK2 files dropped into assets/ and config.example.yaml
+# copied to config.yaml before it runs. Packaging stages assets/ with `git archive`, so
+# only TRACKED files are ever bundled — a working tree holding real Media.pk2/Map.pk2
+# cannot leak SRO data.
+name: build-macos
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to stamp into the artifact name (blank = Cargo.toml version + short sha)'
+        type: string
+        required: false
+      ref:
+        description: 'Ref to build (blank = the ref this was dispatched on)'
+        type: string
+        required: false
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: false
+      ref:
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # The version is part of the group so a hand-dispatched build can never cancel a
+  # release's build of the same target, and only versionless (manual) runs supersede
+  # each other.
+  group: build-macos-${{ inputs.ref || github.ref }}-${{ inputs.version }}
+  cancel-in-progress: ${{ inputs.version == '' }}
+
+env:
+  TARGET: aarch64-apple-darwin
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Blank on a manual dispatch = the dispatched ref. release.yml passes the
+          # bump commit's sha, so the artifact is built from the very commit whose
+          # version it is named after — not from whatever main pointed at when the
+          # release run started.
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # `rustup target add` rather than the action's `targets:` input on purpose: it
+      # resolves through rust-toolchain.toml, so the target lands on the toolchain cargo
+      # will actually use even if that pin ever stops being plain `stable`.
+      - name: Add the target
+        run: rustup target add "$TARGET"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-darwin
+
+      # A release build carries the exact version release.yml bumped to. A manual build
+      # appends the short sha, so a dev zip can never be mistaken for the release
+      # artifact of the same version.
+      - name: Resolve the artifact name
+        id: name
+        env:
+          IN_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$IN_VERSION" ]; then
+            VERSION="$IN_VERSION"
+          else
+            VERSION="$(python3 scripts/bump_version.py --print)-g$(git rev-parse --short HEAD)"
+          fi
+          echo "stem=openroad-$VERSION-$TARGET" >> "$GITHUB_OUTPUT"
+          echo "Artifact: openroad-$VERSION-$TARGET.zip"
+
+      - name: Build the client
+        run: cargo build --release --package client --target "$TARGET"
+
+      - name: Package
+        env:
+          STEM: ${{ steps.name.outputs.stem }}
+        run: |
+          set -euo pipefail
+          STAGE="dist/$STEM"
+          mkdir -p "$STAGE"
+          cp "target/$TARGET/release/client" "$STAGE/"
+          git archive HEAD assets | tar -x -C "$STAGE"
+          cp config.example.yaml "$STAGE/"
+          # The zip is all a player gets, so the run instructions travel with it.
+          cp docs/RUNNING.md "$STAGE/README.md"
+          (cd dist && zip -qr "$STEM.zip" "$STEM")
+          # Capture the listing first so `set -e` aborts on an unreadable zip. Piping
+          # unzip straight into grep would hand the pipeline's status to grep, and a
+          # failed listing would read as "no PK2 found" — the guard must fail closed.
+          LISTING="$(unzip -l "dist/$STEM.zip")"
+          printf '%s\n' "$LISTING"
+          # Belt and braces: the staging above cannot pick up a PK2, so assert it.
+          if printf '%s\n' "$LISTING" | grep -qi '\.pk2'; then
+            echo "::error::SRO asset found in the artifact — refusing to upload"; exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.stem }}
+          path: dist/${{ steps.name.outputs.stem }}.zip
+          retention-days: 14
+          if-no-files-found: error

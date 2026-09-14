@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Planning docs (roadmap, backlog, status)
+    url: https://github.com/ferdoran/openroad/tree/main/docs/planning
+    about: Read ROADMAP.md / BACKLOG.md before filing feature work — most tickets already exist there in paste-ready form.

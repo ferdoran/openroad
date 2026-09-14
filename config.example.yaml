@@ -1,0 +1,550 @@
+# PK2 archive key. REQUIRED — there is no built-in default, and the client
+# refuses to start without one.
+#
+# The archives you point SRO_PATH at are encrypted, so reading them means
+# holding the key that opens them. OpenRoad does not ship that key: it belongs
+# with the game data it decrypts, which is yours, not ours. Supply it here (this
+# file is gitignored) or through the environment, which takes precedence:
+#
+#   SRO_PK2_KEY / SRO_PK2_SALT     archive key  (used by client, launcher, tools)
+#   SRO_SVT_KEY / SRO_SVT_SALT     launcher's SV.T version-file key
+#
+# `key` is plain text; `salt` is hex, because a byte array has no unambiguous
+# YAML spelling. Both entries of a pair are required — a key without its salt
+# derives a different cipher and will fail to open the archive.
+#
+# The values for a stock v1.188 client are widely documented; this project does
+# not distribute them. See docs/formats/pk2-jmxpack.md for where the key enters
+# the format.
+#pk2:
+#  key: ""
+#  salt: ""
+#  version_key: ""
+#  version_salt: ""
+
+network_settings:
+  enabled: true
+  # Optional override. Comment this out to use the gateway your own Media.pk2
+  # names (divisioninfo.txt + gateport.txt). ip:port or hostname:port, resolved
+  # via DNS at connect.
+  gateway_address: "127.0.0.1:15779"
+  packet_dump: true # append received packets to packet_dump/<opcode>.log and sent ones to packet_dump/c2s/<opcode>.log (hex lines)
+  # Encrypt the identity/login opcodes on the way out, as the original client
+  # does. Off by default: with it off the account password goes out in plaintext
+  # (#243), but our plaintext login is what the reference server accepts today —
+  # turn it on once one live login confirms the encrypted form is accepted.
+  outbound_encryption: false
+  # Send item-use requests (0x704C) — using a potion, summoning a COS from its
+  # scroll. Off by default because the go-sro reference server does not
+  # implement the opcode and RESETS THE CONNECTION on receipt (#215); turn it
+  # on against a server that supports it (e.g. vSRO), where item use is
+  # otherwise silently suppressed with a log line.
+  item_use_enabled: false
+window_settings:
+  width: 1920.0
+  height: 1080.0
+  # Windowed, BorderlessFullscreen, Fullscreen (exclusive, keeps the monitor's
+  # current video mode). SizedFullscreen still parses as BorderlessFullscreen —
+  # bevy 0.19 dropped that variant.
+  mode: BorderlessFullscreen
+  title: "OpenRoad Client"
+  # Current or Primary. The payload-carrying `Index(n)` / `Entity(e)` selectors
+  # of bevy's MonitorSelection cannot be written in this file: config-rs 0.14
+  # cannot build a newtype enum variant from YAML (see #539).
+  monitor: Primary
+  # How finished frames reach the display - this is the VSync switch.
+  #
+  #   immediate     present as soon as a frame is ready; may tear. The default,
+  #                 and the only mode that reports a true throughput number,
+  #                 which is why every reading in docs/perf-baselines.md uses it.
+  #   fifo          wait for vblank. Ordinary VSync.
+  #   fifo_relaxed  like fifo, but a late frame presents immediately instead of
+  #                 waiting for the next refresh - less stutter, some tearing.
+  #   mailbox       replace the queued frame instead of blocking.
+  #   auto_vsync    fifo_relaxed if available, else fifo.
+  #   auto_no_vsync immediate, else mailbox, else fifo.
+  #
+  # NOTE: this is a request, not a guarantee. Bevy falls back silently when the
+  # surface does not support a mode - immediate degrades to fifo with no log
+  # line - so the only way to know which mode is live is behaviour: on a 75 Hz
+  # display, fifo caps the frame at 13.33 ms and immediate does not.
+  present_mode: immediate
+  # Swapchain depth: how many frames the GPU may have in flight before the
+  # renderer must wait for one to finish presenting. Unset uses the driver
+  # default (2).
+  #
+  # Worth knowing before changing it: measured at the default, nothing in the
+  # frame was saturated - the main thread waited 12.5 ms, the render thread
+  # waited 10.8 ms for a swapchain image, and the GPU was busy only ~13.9 ms of
+  # a 21.9 ms frame. A shallow chain cannot start the next frame's GPU work
+  # until the last one has been presented, so those two serialise instead of
+  # overlapping. Raising this trades input latency for that overlap.
+  #
+  # RESTART-ONLY: bevy reads it once, when it creates the surface. Changing it
+  # in a running client does nothing.
+  # max_frame_latency: 3
+# Render quality. Bloom puts the main cameras on an HDR target, which is what
+# lets emissive props and the +N enhancement shine glow instead of clipping at
+# white. Disabling it restores the original LDR rendering exactly.
+graphics:
+  bloom:
+    enabled: true
+    intensity: 0.15 # energy-conserving scatter strength, 0.0-1.0
+  # Metallic sheen on weapons/metal armor. Defaults adopt the mobile port's
+  # modernized look; the commented value on each line restores faithful 1.188.
+  sheen:
+    shine_pow: 2.0 # +N streak sharpening (streamerPOW); 1.0 = faithful soft streak
+    # Brightness of the +N enhancement glow. The per-tier intensities are
+    # scene-linear HDR values picked for a bloom-lit pipeline; with bloom off
+    # the cameras have no HDR target, tonemapping happens in the forward pass
+    # and the glow is squashed nearly flat. This scales them, so the weapon
+    # glow is tunable without turning bloom on for an unrelated reason.
+    # 1.0 = the raw tier values. Lower it if you run with bloom on.
+    # Both of these are read once at startup (the .bmt materials bake them),
+    # so a change needs a restart.
+    intensity: 3.0
+  # Always-on subtle rim light on characters/NPCs/monsters and equipment
+  # (mobile-port look; the original has none). Selection highlighting is
+  # separate and stays available with enabled: false.
+  rim:
+    enabled: true
+    color: "5AFFFFFF" # AARRGGBB; alpha = strength (0x5A ~ mobile's 0.353)
+    power: 3.0 # fresnel falloff (mobile ships 3)
+    mode: relative # relative = lit x (1 + rim), survives HDR; absolute = plain add
+    strength: 1.0 # extra multiplier on the color alpha (headroom past 1.0)
+  # Terrain lighting A/B (also live in the render-debug panel):
+  # dynamic = PBR sun+ambient over the baked lightmap (current);
+  # flat_baked = no N·L but keeps the time-of-day tint;
+  # baked = albedo x lightmap only (mobile/original ground, no day/night).
+  terrain:
+    lighting: dynamic
+    lightmap_flip_v: false # V-axis calibration of the baked .t lightmap
+  # Dynamic sun shadows (cascaded shadow maps). With enabled true, hotkey
+  # N toggles between the faithful look (baked lightmap + only the player
+  # casting a crisp, player-scoped shadow — the default) and PBR
+  # (everything casts, no lightmap). Set enabled false to hard-disable
+  # shadow maps in both modes (measure cost with `make perf`).
+  # cascades/distance apply to PBR mode ONLY — vanilla always uses a
+  # built-in tight config around the player. Beware large distances: the
+  # map_size resolution is spread over the whole range, so huge values
+  # blur every shadow into a faint blob; ~600-1000 keeps PBR shadows
+  # sharp. map_size (power of two, default 2048) trades GPU memory for
+  # shadow crispness in both modes.
+  shadows:
+    enabled: true
+    cascades: 2
+    distance: 120.0
+    map_size: 2048
+    # Shadow-edge filtering: gaussian | hardware_2x2.
+    #
+    # This is a per-lit-PIXEL cost, not a shadow-map cost, so it scales with
+    # screen resolution rather than with map_size or cascades. gaussian
+    # (Bevy's default, and what this shipped with) is a 9-sample kernel;
+    # hardware_2x2 is a single hardware comparison sample.
+    #
+    # The trade is smallest in the default vanilla mode, where only the player
+    # casts into a tight cascade close to the camera - and a hard-edged shadow
+    # there is arguably nearer the original client, which has no PCF at all.
+    filtering: gaussian
+  # Ground foliage. native = the tile-driven 3D-grass *authored* in your own
+  # Data.pk2 (tile2d.ifo {model,count} pairs); pack = bundled CC0 card layer
+  # on grass tiles; both = overlay. NOTE: the original v1.188 client parses
+  # the pairs but never renders them (RE-verified, docs/formats/
+  # 2dti-jmxv2dti.md), so `off` is the faithful setting and every other mode
+  # is an enhancement built on authored-but-unused game data.
+  foliage:
+    # "off" (default) = faithful 1.188. Enabling any other mode is an FPS
+    # trade: a region holds ~1.8k blocks of tufts. Quoted because bare `off`
+    # is a YAML boolean.
+    mode: "off"
+    # 0 = render every tuft on the map, every frame; >0 = cutoff in world
+    # units. 300 (default) covers the camera's 40..400 working range.
+    view_distance: 300.0
+    # Multiplier on the authored counts, read as tufts per 320x320 BLOCK
+    # (scaled by tile coverage). The exe never reads the count field, so
+    # there is no original reference density — pure taste knob.
+    density: 1.0
+    # Grass casts sun shadows: one extra alpha-masked draw of every grass
+    # mesh per shadow cascade — cheap with the scoped default shadows
+    # (2 cascades x 120 units), expensive with huge shadow distances.
+    # false (default) = grass still receives shadows, just doesn't cast them.
+    cast_shadows: false
+    pack:
+      density: 8.0 # tufts per 20x20 cell on Grass/LongGrass tiles
+      scale: 1.0
+    # Environment blending: grass takes on the average color of the tile it
+    # stands on (tile_blend_*, 0..1) and the region's baked per-cell light
+    # (baked_light, 0 = off). Native grass textures already match their
+    # tiles, so its blend stays subtle; 0.0 everywhere = faithful colors.
+    tint:
+      tile_blend_pack: 1.0
+      tile_blend_native: 0.25
+      baked_light: 0.5
+  dungeon:
+    # Placeholder ring on dungeon gate trigger circles (offline world/dungeons
+    # scenes). Non-original: the real client marks gates with a portal glow
+    # effect (not yet reproduced); false hides the stand-in.
+    gate_circles: true
+    # Cap on active dungeon point lights (nearest to the player win; 0 =
+    # unlimited). Dense dungeons like the Donwhang cave author hundreds of
+    # lights; this is a performance calibration knob, not PK2 data.
+    max_lights: 16
+  # Distance fog. The color/planes come from the environment profiles; the only
+  # knob here is the sun's in-scattering halo — a glow blended into the fog
+  # around the sun direction. The original's fixed-function fog has no such
+  # term, so 0.0 is the faithful setting and this is purely an enhancement.
+  # It defaults off because the sun color reaches the shader premultiplied by
+  # its 10k-lux illuminance and modulated by the shadow map, which made distant
+  # fogged objects carry a moving highlight that read as gloss, not haze.
+  fog:
+    sun_scattering: 0.0 # halo strength; 0.5 was the old always-on value
+    # pow() tightness of the halo, only used when sun_scattering > 0. The old
+    # value of 100 is half-strength at ~6.7 degrees — a hot disc rather than a
+    # glow, which is what made it look specular. Lower = broader.
+    sun_scattering_exponent: 30.0
+  # Per-part distance LOD for map objects (props, buildings, rocks). A part
+  # whose largest dimension is S stops being drawn past roughly S * factor —
+  # the "constant screen size" heuristic — with `min_distance` as a floor so
+  # nothing close is ever culled, and `fade` the dither band before the cut.
+  # The ceiling is always the fully-fogged distance, so this only trims parts
+  # the whole-object fog cull was still drawing.
+  #
+  # The original client has no per-part LOD to match (its draw distance is a
+  # fixed fog range), so these are a hardware knob, not a fidelity one: lower
+  # `factor` or `min_distance` to cut draw items on a fill-limited GPU.
+  objects:
+    factor: 150.0
+    min_distance: 1200.0
+    fade: 600.0
+  # Multisample anti-aliasing for the window cameras: 1 (off), 2, 4 or 8.
+  #
+  # This is the renderer's largest fixed cost — it multiplies rasterization AND
+  # the depth prepass by the sample count, which is exactly what an integrated
+  # GPU is worst at. The main cameras also run an FXAA post pass, so 4 is
+  # largely paying twice for edge quality: on a fill-limited laptop GPU, `1`
+  # with FXAA still on is the single biggest frame-time win available here.
+  #
+  # 4 is Bevy's default and what this shipped with. The value applies to every
+  # camera drawing to the window at once (they must agree — see
+  # `camera::apply_window_camera_msaa`); the offscreen portrait and paper-doll
+  # rigs are unaffected.
+  msaa: 4
+  # Water shader tier: high | low.
+  #
+  # high (default) is the current look — a transmissive material with real
+  # refraction, two scrolling ripple-normal octaves and a screen-space
+  # reflection raymarch. It is the most expensive per-pixel path in the
+  # renderer, and two of its costs are paid whenever ANY water is on screen,
+  # not in proportion to how much: transmission puts it in Bevy's Transmissive
+  # phase, which copies the whole main texture every frame, and the surface is
+  # excluded from the depth prepass (it raymarches that prepass), so it gets no
+  # early-Z and shades every overdrawn pixel in full.
+  #
+  # low keeps only the scrolling surface: no transmission, no reflection march,
+  # no ripple samples, ordinary alpha blending instead of refraction. Ice drops
+  # transmission too, since one transmissive mesh in view is enough to trigger
+  # the copy. Closer to the original client's fixed-function scrolling water
+  # than high is.
+  water:
+    quality: high
+  # Fraction of the window the 3D view renders at. The HUD is always composited
+  # at the window's native size, so text and icons stay sharp; only the world
+  # softens, and an FXAA post pass already runs over it.
+  #
+  # At 3440x1440 the frame is fill-bound - cost tracks pixels, not draw calls or
+  # geometry (docs/perf-baselines.md) - so this is the largest lever left. 0.85
+  # is ~28% fewer 3D pixels; 0.75 is ~44% fewer.
+  #
+  # 1.0 (the default) retargets nothing at all and is byte-identical to having
+  # no render scale. Valid range 0.25..=1.0; anything else falls back to 1.0
+  # with a warning.
+  #
+  # It is also the measurement instrument: mirrored onto RenderDebugSettings, so
+  # `make perf set render_scale=0.8` runs a resolution ladder in one session
+  # without relaunching.
+  render_scale: 1.0
+  # Tonemapping curve: tony_mc_mapface | reinhard_luminance | none.
+  #
+  # This is a full-screen post pass, and it runs whether or not there is
+  # anything HDR to tonemap. With bloom disabled the cameras carry no HDR
+  # target, so the curve is applied to values already clamped to 0..1 - a
+  # full-screen read, LUT sample and write to transform an LDR image. For
+  # scale: FXAA covers the same screen for simpler math and costs ~0.95 ms at
+  # 1920x1080.
+  #
+  # none skips the pass entirely (and the deband dither that rides with it). It
+  # is NOT pixel-identical, but it is the more faithful setting: the original
+  # client is fixed-function D3D8 and applies no tonemap curve at all.
+  #
+  # Keep tony_mc_mapface (Bevy's default, and what this shipped with) if bloom
+  # is on - that is the case the curve exists for.
+  tonemapping: tony_mc_mapface
+# Combat presentation.
+combat:
+  # Seconds a knocked-down body lies there (DOWN_RM, anim type 63) between the
+  # fall (DOWN, 62) and getting up (DOWN_UP, 65).
+  #
+  # NEGATIVE (the default) = derive it from the game's own data: the victim's
+  # characterdata KO_RecoverTime (col 82) when that reads as a duration, else
+  # the authored length of the lying-down animation itself. Set >= 0 to override
+  # both with a fixed dwell.
+  #
+  # It is derived rather than a constant because no packet in the capture corpus
+  # says how long a body stays down and the original's value lives in its code
+  # (docs/re/formats/anim-state-coverage.md §9). Both fallbacks are real game
+  # data. The column's unit is still unverified, so the derived value is clamped
+  # to 5s — see CharacterDataRow::knockdown_recover_secs.
+  knockdown_hold_seconds: -1.0
+
+  # How long a hotkey press may wait for the server's single action slot before
+  # it is dropped as stale.
+  #
+  # The server takes one action at a time and refuses anything sent while one is
+  # running, so presses that arrive faster than that are held instead of spammed
+  # onto the wire: at most one waits, and a newer press replaces it (the thing
+  # you pressed last is the thing you want). Mashing one skill therefore sends
+  # one request instead of fourteen.
+  #
+  # A held press also waits for the cast it follows to finish animating, so the
+  # window has to cover the longest clip a player can be waiting on: the longest
+  # authored chain animation in the corpus is skill_ch_sword_chain_h.ban at
+  # 5.1s, and 5.5 is that plus slack. A press held past it is waiting on
+  # something that should long since have finished, so firing it would act on an
+  # intent you have moved on from. Set 0.0 to never hold a press at all.
+  #
+  # A press whose target dies while it waits is dropped by an explicit liveness
+  # check, not by this window.
+  #
+  # Buffering presses at all is a deliberate deviation (ADR 0009): no capture of
+  # the original client's outbound traffic exists to copy.
+  action_buffer_seconds: 5.5
+hud:
+  # skill window board from skilldata's native grid columns (vanilla
+  # placement); false = the derived skillgroup.txt layout
+  skill_window_native_grid: true
+  # seconds the zone-entry region banner stays up (0 = off). The original's
+  # dwell time is code-side and unknown, so it is a knob, not a constant.
+  region_banner_seconds: 4.0
+  # seconds a CIFNotify toast stays up (0 = off). No timer exists anywhere in
+  # resinfo, so this is ours, not the original's.
+  toast_seconds: 4.0
+  # true restores the original's warning tint, which is byte-identical to the
+  # quest-update one (255,119,119,251 ARGB) — severity carried by nothing.
+  toast_original_warning_color: false
+  # Hide the mini-info's stat-up (+) button while there are no points to spend.
+  # The original draws it always and greys it (Style=0 plus a _disable art
+  # variant); we hide it, so its appearance is itself the "you levelled" cue.
+  # Set false for the original's permanently-visible greyed button. The
+  # character window's own +STR/+INT buttons are unaffected either way.
+  hide_statup_when_empty: true
+  # Milliseconds per frame of the animated item-icon overlays — the sweep on
+  # Seal-grade and Nasrun items, and the summoned-COS marker
+  # (icon/item/etc/icon_edge_*.ddj). The sheets are real art and their grids are
+  # measured, but NO resinfo control references them, so the original's cadence
+  # lives in its code and is unrecoverable — hence a knob, not a constant.
+  # Lower is faster; 0 freezes on the first frame.
+  icon_effect_frame_ms: 50.0
+  # FALLBACK length for the cast/delay gauge (return scrolls and other long
+  # actions), in seconds. Not normally used: an item's cast time comes from its
+  # own itemdata row (column 119, in milliseconds), so a 30s scroll fills over
+  # 30s and a 1s "high speed" scroll over 1s. This only covers a cast the client
+  # cannot attribute to an item. Kept at the shortest measured return, since a
+  # bar that finishes early and waits beats one still crawling when you teleport.
+  cast_gauge_seconds: 15.4
+  # How long the quickslot arm ring (ub_slot_arrow.ddj, GDR_QS_INIDCTION) stays
+  # on the last-used slot before fading out and disarming it. The ring is real
+  # vanilla art but no resinfo control carries a dwell, so the original's timing
+  # is code-side and unrecovered — a knob, not a constant. It used to never
+  # expire, which left the last slot you touched framed for the whole session.
+  # NOT purely cosmetic: arming is also what a second mouse press casts from, so
+  # once it expires a click on that slot arms again instead of firing. Set the
+  # hold negative to restore the old never-expires behaviour.
+  quickslot_arm_hold_seconds: 2.5
+  quickslot_arm_fade_seconds: 0.5 # 0 = vanish instantly at the end of the hold
+  # Mini-info low-HP/MP warning overlays (ifplayerminiinfo.txt ids 77/78): the
+  # original ships the whole 8-frame animation in data but NO trigger threshold,
+  # so this is a knob rather than a constant. 0 (default) keeps them off; e.g.
+  # 25 lights them at a quarter HP/MP.
+  low_vitals_caution_percent: 0
+  # uniform multiplier for every HUD surface. Ours, not the original's: vanilla
+  # authors its rects in a 1:1 1024x768-era window space, which is unreadable on
+  # a modern display. 1.0 gives the original's own pixel sizes.
+  hud_scale: 1.5
+  party:
+    # Interpolate member HP/MP from nearby spawned entities instead of the
+    # wire's own 10% steps. Off = the original's coarseness: the party packet
+    # packs both bars into one byte's nibbles, so the bars really do have 11
+    # levels. On is strictly more information than the party wire carries.
+    smooth_vitals: false
+    # Show each member's two mastery icons. The original shows masteries in
+    # NEITHER the roster nor the quick board (only in the match board's
+    # join-request dialog), so this is an addition — but the ids are on the
+    # wire already, so nothing is invented.
+    show_masteries: true
+    # Member portrait source. The original picks this in code and the candidate
+    # art is all backdrops and status tints, so there is no original answer to
+    # copy. icon = characterdata's own icon column keyed on the member's model
+    # id (data-derived); race = pick the race/gender art; none = backdrop only.
+    portrait_source: icon
+    # AARRGGBB tint for the match-board row of the party you are in. Ours, not
+    # the original's — the board's data has no concept of "your own entry".
+    own_party_color: "FF7FB2FF"
+scenes:
+  # Which cutscene the intro plays. Empty follows your own client: openroad
+  # reads `config/option.txt` from your Media.pk2 and uses the `IntroName` and
+  # `IntroBGM` it enables, then converts that camera script at startup — no
+  # `.intro` file needed. Set a script name (e.g. china_wharf, constantinople,
+  # egypt, roc) to pin one regardless of what option.txt says — the track
+  # still comes from option.txt's IntroBGM, which the original keeps as a
+  # separate setting rather than a per-cutscene property. An
+  # `assets/intros/<name>.intro` on disk still overrides both.
+  intro_location: ""
+  char_select_location: constantinople
+  # Default entry: the real game flow (intro_v2 → login → character select →
+  # GameWorld). Use `make run world` (or startup: world) for the fly-cam dev
+  # sandbox, `make run dungeons` for the offline dungeon test scene.
+  # Note: dev_fast_login only runs in intro_v2.
+  startup: intro_v2
+# The whole developer surface, off by default. Covers:
+#   - the egui world/resource inspectors and the "dev" corner button that
+#     toggles them, plus the GM-command / COS-spawner / teleport /
+#     player-config / render-debug panels
+#   - every bare-letter debug hotkey: Q wireframe, E/T/U/I/P light and
+#     env-probe tweaks, E/T/Y/U navmesh and AABB overlays, B glass ball,
+#     N vanilla/PBR switch, Shift+M time-of-day pause, K/L time-of-day scrub
+#   - everything `diagnostics` below turns on
+# Several of those letters are bound vanilla HUD shortcuts (I inventory,
+# T auto-potion, Y alchemy, L academy), so a play session must not have them
+# claimed — that is why this is one switch and not several.
+# Costs significant FPS in the world scene; enable only when debugging.
+# Restart-only: it decides plugin registration, and Bevy cannot add or remove
+# a plugin after startup.
+dev_tools: false
+# The measurement tier on its own: the Bevy Remote Protocol server that
+# `make perf` talks to, per-render-pass GPU/CPU timings, per-phase draw
+# counts, and the render-world asset counters.
+#
+# Separate from dev_tools because that switch also brings the world inspector
+# and the navmesh debug draws, which between them cost double-digit FPS — so
+# every number taken through it described a build nobody plays. Leave this on
+# and dev_tools off to profile the shipping configuration
+# (docs/perf-baselines.md). Restart-only, same reason as above.
+diagnostics: false
+# Developer fast-login: logs in and joins the first character on the intro_v2
+# scene with no manual steps. Also supplies the credentials for the headless
+# net-check client (`make netcheck`).
+#
+# This is openroad-only convenience and is NOT the original's "Auto Login" —
+# v1.188 has a feature by that name (textuisystem.txt:233-234) and it is a login
+# QUEUE for full shards, which we do not implement. Off by default. The old
+# `autologin:` key still works as an alias.
+dev_fast_login:
+  enabled: false
+  username: ""
+  password: ""
+  # IBUV image-code answer (0x2322). Only useful against a server whose captcha
+  # is constant — the code is a server-generated image, so there is no default
+  # that could be right. Unset: the normal captcha modal handles the challenge.
+  captcha_answer:
+
+# Chat window customization. Colors are AARRGGBB hex.
+chat:
+  # Fade the chat chrome out after ~10 idle seconds. The original v1.188
+  # client has no idle fade (it ships a manual transparency slider), so this
+  # is off by default and opt-in as non-original behaviour.
+  idle_fade: false
+  # No per-channel colour table exists in the PK2 — the original's values are
+  # compiled into the client — so these are our own defaults, not vanilla.
+  colors:
+    normal: "FFFFFFFF"     # local/All chat (and NPC lines)
+    whisper: "FF00FFFF"
+    party: "FF00FF00"
+    guild: "FFFFB541"
+    gm_notice: "FFFF00FF"  # GM chat, notices, client info lines
+    union: "FFC2F573"
+    academy: "FF64C7FF"
+    global: "FFFFFF00"
+
+# Floating name labels over characters (AARRGGBB hex).
+nameplates:
+  colors:
+    local_player: "FFFFFFFF"    # your own character
+    player: "FFB2D9FF"          # other players
+    npc: "FFB2D9FF"
+    monster: "FFFFFFFF"
+    unique_monster: "FFFF8C1A"  # unique / world-boss monsters
+  # Bold face on the hovered/selected label. Deviation from the original: the
+  # PK2 UI faces have no bold cut, so this is a readability tweak — set false
+  # for the original's single face (the underline stays either way).
+  hover_bold: true
+
+# Hover / click-to-select highlight over characters.
+selection:
+  highlight:
+    hover_rim: "FFCFE4FF"       # rim color while hovered
+    selected_rim: "FFFFD873"    # rim color while click-selected
+    rim_strength: 0.4           # rim glow intensity
+    rim_power: 3.0              # fresnel falloff (higher = thinner edge)
+    emissive_strength: 0.06     # whole-model lighten
+    rim_boost: true             # selection rim also on sheen weapons/armor
+  # Ground marker circle under the selected target (tint over the white ring).
+  decal:
+    monster: "FFFF7A66"         # light red
+    npc: "FFB2D9FF"             # light blue
+    player: "FFB2D9FF"
+    size: 12.0                  # world-space marker size
+
+# Mouse scheme for the follow camera.
+input:
+  # zoom_orbit (default, NON-ORIGINAL): wheel zooms and the right button orbits,
+  #   so both devices drive the camera and neither is free for shortcuts.
+  # vanilla: the original's two-state pair (textuisystem 917/918), selected by
+  #   the persisted SROptionSet id 3101 — exactly one device changes the view
+  #   and the other is reserved for shortcut use (which openroad does not
+  #   implement yet, so that device currently does nothing).
+  mouse_scheme: zoom_orbit
+
+# Particle effect played on your character when the server confirms an item use
+# (0xB04C). The client ships a small default table: HP/MP/vigour potions, the
+# revival item and the return scroll, using your own Particles.pk2's
+# system/item_*.efp effects. Requires network_settings.item_use_enabled —
+# without it no use is ever sent, so nothing can play.
+#
+# `item_use` below is COMMENTED OUT on purpose. Uncommenting it REPLACES the
+# whole shipped table, so an empty map here means "no effects at all" rather
+# than "the defaults". Only set it to override.
+#
+# Keys are type-id prefixes and the longest match wins, so "3.3.1" can set every
+# potion and "3.3.1.1" override just the HP line. A value is either one path or a
+# list of paths played together. Using an item with no row logs the exact key to
+# add; to see what your archive offers:
+#   make pk2 list PK2=assets/Particles.pk2 | grep -iE '^(system/item_|battle/status_|skill/china/)'
+#
+# The "3.3.2" row (the cure branch: universal pill, purification pill, COS
+# cure-all) plays two effects, and its first one IS OUR PICK. The archive keys
+# cure bursts to the ailment — battle/status_cure_{blind,burn,eshock,frostbite,
+# poison,zombie} — and ships no "cure all", so a pill that clears everything has
+# no burst of its own; poison is our choice among the six. The ring is sourced:
+# skilleffect.txt binds water_cure_effect_a to SKILL_CH_WATER_CURE_A, the CH
+# Force mastery's "Force Cure - Poison".
+effects:
+  # item_use:
+  #   "3.3.1.1": "particles://system/item_hpotion.efp"
+  #   "3.3.3.1": "particles://system/item_returnscroll_use.efp"
+  #   "3.3.2":
+  #     - "particles://battle/status_cure_poison.efp"
+  #     - "particles://skill/china/water_cure_effect_a.efp"
+  item_use_seconds: 2.0 # how long the effect wrapper lives (ours; .efp has no play-once flag)
+fonts:
+  # Which face the HUD draws with.
+  # false (default): the bundled OFL face, Arimo — metric-compatible with
+  #   Arial, variable weight, and Regular by default (the HUD used to draw in
+  #   Fira Sans *Medium*, which read heavier). Latin only: it has no Hangul.
+  # true: load the original's UI face from your own Media.pk2
+  #   (Media/fonts/기본서체.ttf). Turn this on for the original's typography, or
+  #   when your server's item and NPC names are Korean. If the archive has no
+  #   such file, or no PK2 is configured, the bundled face keeps rendering —
+  #   text never disappears.
+  # This repository ships only OFL-licensed fonts; the original's faces are
+  # yours to supply, exactly like every other SRO asset.
+  pk2_faces: false

@@ -1,0 +1,149 @@
+# Weekly branch/issue hygiene robot.
+#
+# IDEA. EP-01 found 38 dead branches of 45 and 11 issues left open for work that had
+# already merged. That mess is cheap to detect and expensive to let accumulate, so this
+# job re-derives both lists every week and keeps them in ONE tracking issue that it
+# edits in place — no issue spam, and deliberately no automation of the destructive
+# part: it never deletes a branch and never closes an issue, it only reports.
+#
+# It talks to the GitHub API only: no repository checkout, no cargo, no PK2 assets, no
+# network fetches — which is why it can run on a schedule in a repo whose real gate is
+# local `make ci` (Makefile:204-207). The sibling `build-*.yml` workflows do check out
+# and compile, but only ever on manual dispatch, and they gate nothing — see
+# CONTRIBUTING.md.
+name: branch-hygiene
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'      # Mondays 06:17 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Print the report instead of writing the tracking issue'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: branch-hygiene
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build the hygiene report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NO_COLOR: '1'
+        run: |
+          python3 - <<'PY' > report.md
+          import json, re, subprocess
+
+          def gh(*args):
+              out = subprocess.run(['gh', *args], capture_output=True, text=True, check=True).stdout
+              return json.loads(out) if out.strip() else []
+
+          repo = subprocess.run(['gh','repo','view','--json','nameWithOwner','--jq','.nameWithOwner'],
+                                capture_output=True, text=True, check=True).stdout.strip()
+
+          # --- (a) remote branches 0 commits ahead of main -------------------------
+          # A branch with an OPEN PR is never a deletion candidate, however far behind
+          # it is: that is the loop's in-flight work (work/issue-<N> claim refs).
+          open_pr_heads = {p['headRefName'] for p in
+                           gh('pr','list','--state','open','--limit','200','--json','headRefName')}
+          # No --paginate here: with --jq it emits one JSON doc per page, which does
+          # not parse. 100 branches is far above this repo's ceiling (EP-01 capped it
+          # at 7); if it were ever exceeded the list would silently truncate, so the
+          # count is asserted below.
+          branches = gh('api', f'repos/{repo}/branches?per_page=100', '--jq', '[.[].name]')
+          assert len(branches) < 100, 'branch list hit the page size — add pagination'
+          dead, claims = [], []
+          for b in branches:
+              if b == 'main':
+                  continue
+              cmp = gh('api', f'repos/{repo}/compare/main...{b}', '--jq',
+                       '{ahead:.ahead_by, behind:.behind_by}')
+              if cmp['ahead'] != 0:
+                  continue
+              # A `work/issue-<N>` ref is the work-loop's mutex (WORK_LOOP_RUNBOOK §1):
+              # a freshly won claim has 0 commits BY CONSTRUCTION, so reporting it as a
+              # deletion candidate would be a false positive against live work. It goes
+              # in its own do-not-touch section instead.
+              (claims if b.startswith('work/') else dead).append(
+                  (b, cmp['behind'], b in open_pr_heads))
+
+          # --- (b) open issues referenced by MERGED PRs ---------------------------
+          merged = gh('pr','list','--state','merged','--limit','200','--json',
+                      'number,title,body,closingIssuesReferences')
+          refs = {}
+          for pr in merged:
+              nums = {i['number'] for i in pr.get('closingIssuesReferences') or []}
+              nums |= {int(n) for n in re.findall(r'(?:closes|fixes|resolves)\s+#(\d+)',
+                                                  pr.get('body') or '', re.I)}
+              for n in nums:
+                  refs.setdefault(n, []).append(pr['number'])
+          still_open = []
+          for n in sorted(refs):
+              try:
+                  st = gh('issue','view',str(n),'--json','state,title')
+              except subprocess.CalledProcessError:
+                  continue          # not an issue in this repo (PR number, or deleted)
+              if st.get('state') == 'OPEN':
+                  still_open.append((n, st['title'], sorted(refs[n])))
+
+          print('<!-- branch-hygiene-robot -->')
+          print('_Regenerated weekly by `.github/workflows/branch-hygiene.yml`. '
+                'Nothing here is applied automatically — a human deletes and closes._\n')
+          print('## Branches 0 commits ahead of `main`\n')
+          if dead:
+              print('| branch | behind | open PR? |')
+              print('|---|---:|---|')
+              for b, behind, has_pr in dead:
+                  print(f'| `{b}` | {behind} | {"yes — leave alone" if has_pr else "no"} |')
+          else:
+              print('None. :tada:')
+          print('\n## Claim refs with no commits (`work/*`) — do NOT delete\n')
+          print('_The work loop\'s mutex (WORK_LOOP_RUNBOOK §1). A just-won claim has 0'
+                ' commits; reclaim only under §1.4._\n')
+          for b, behind, has_pr in claims:
+              print(f'- `{b}` (behind {behind}{", open PR" if has_pr else ""})')
+          if not claims:
+              print('None.')
+          print('\n## Open issues referenced by a merged PR\n')
+          print('_Check before closing: a **revert** (`docs/adrs/adr-0010-revert-rationale.md`)'
+                ' legitimately reopens the issue its PR had closed, so an entry here can be'
+                ' correct rather than stale._\n')
+          if still_open:
+              print('| issue | title | merged PR(s) |')
+              print('|---|---|---|')
+              for n, title, prs in still_open:
+                  print(f'| #{n} | {title} | ' + ', '.join(f'#{p}' for p in prs) + ' |')
+          else:
+              print('None. :tada:')
+          PY
+          cat report.md
+
+      - name: Post or update the tracking issue
+        if: ${{ github.event_name == 'schedule' || !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NO_COLOR: '1'
+          TITLE: 'Branch & issue hygiene — weekly robot report'
+        run: |
+          set -euo pipefail
+          NUM=$(gh issue list --state open --search "in:title \"$TITLE\"" \
+                  --limit 5 --json number,title \
+                  --jq "[.[]|select(.title==env.TITLE)]|first|.number // empty")
+          if [ -n "${NUM}" ]; then
+            gh issue edit "${NUM}" --body-file report.md
+            echo "updated #${NUM}"
+          else
+            gh issue create --title "$TITLE" --body-file report.md
+          fi

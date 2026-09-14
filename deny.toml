@@ -1,0 +1,66 @@
+# cargo-deny configuration — the supply-chain half of the merge gate.
+#
+# The dependency tree is permissive today; this exists to keep it that way, so a
+# future `cargo add` of a copyleft or unlicensed crate fails the gate instead of
+# quietly contaminating the tree. See CONTRIBUTING.md for the source-licence
+# rules that govern code we write; this file governs code we pull in.
+#
+# Run with `make deny` (or `cargo deny check`). Install: `cargo install cargo-deny`.
+
+[graph]
+all-features = true
+
+[licenses]
+# Every licence below is present in, or acceptable for, the current tree.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "Unlicense",
+    "BSL-1.0",
+    "NCSA",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    # Bundled fonts (see THIRD-PARTY.md); not code.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    # Weak, file-level copyleft, reaching only `launcher` via iced's svg feature
+    # -> resvg/usvg. MPL-2.0 is GPL-compatible, and this tree is GPL throughout.
+    "MPL-2.0",
+    # Our own crates.
+    "GPL-3.0-or-later",
+]
+
+# Deliberately NOT allowed, so adding one fails the gate: AGPL-3.0 (the project
+# may reference skrillax/RSBot behaviour but never port their code), SSPL, CDDL,
+# EPL, and any bare GPL-2.0-only / LGPL that is not offered under an alternative.
+
+confidence-threshold = 0.9
+
+[[licenses.exceptions]]
+# Offered as `MIT OR Apache-2.0 OR LGPL-2.1-or-later`; we take MIT.
+name = "r-efi"
+allow = ["LGPL-2.1-or-later"]
+
+[[licenses.exceptions]]
+# Offered as `Apache-2.0 OR GPL-2.0-only`; we take Apache-2.0.
+name = "self_cell"
+allow = ["GPL-2.0-only"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"   # would have caught launcher's `icons = "0.X"`
+
+[advisories]
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

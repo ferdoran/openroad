@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "context7": {
+      "args": [
+        "-y",
+        "@upstash/context7-mcp"
+      ],
+      "command": "npx"
+    },
+    "brp": {
+      "type": "stdio",
+      "command": "bevy_brp_mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}

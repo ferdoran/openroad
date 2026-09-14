@@ -1,0 +1,99 @@
+[package]
+name = "client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The OpenRoad client: a Rust/Bevy clone of the Silkroad Online v1.188 client."
+license.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = { workspace = true }
+bevy_asset_loader = { version = "0.27", features = ["progress_tracking"] }
+bevy_brp_extras = "0.21.0"
+bevy-inspector-egui = "0.37"
+bevy_egui = "0.40"
+bevy_tweening = "0.16"
+bytes = { workspace = true }
+byteorder = { workspace = true }
+bytemuck = "1.13.1"
+chrono = "0.4"
+config = { version = "0.14", features = ["yaml"] }
+ddsfile = "0.5.2"
+encoding = {version = "0.2"}
+futures = "0.3"
+futures-lite = "2.5"
+iyes_progress = "0.17"
+mac_address = "1.1.7"
+num_enum = "0.7.3"
+pk2 = "0.1.0"
+rand = "0.9"
+rgb565 = "0.1.3"
+thiserror = { workspace = true }
+unidecode = "0.3.0"
+palette = "0.7.2"
+packets = { path = "../packets" }
+bevy_pk2 = { path = "../bevy_pk2" }
+crossbeam = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_derive = "1"
+serde_json = "1"
+serde_yaml = "0.9"
+lebe = "0.5"
+lazy_static = "1.4"
+libflate = "2"
+regex = "1.10"
+image = "0.25"
+# bevy_third_person_camera removed - no Bevy 0.16 support; TODO: re-add or vendor
+#bevy_prototype_debug_lines = { version = "0.11", features = ["3d"] }
+[dependencies.uuid]
+version = "1.2.2"
+features = [
+    "v4",                # Lets you generate random UUIDs
+    "fast-rng",          # Use a faster (but still sufficiently random) RNG
+    "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
+]
+
+# stuck-modifier watchdog (plugins/input_watchdog.rs); 0.2 matches winit's
+# own objc2-app-kit, so no second copy enters the tree
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.2", features = ["NSEvent"] }
+
+[dependencies.bevy]
+workspace = true
+features = [
+    "dds",
+    "file_watcher",
+    "vorbis",
+    "bevy_render",
+    "bevy_pbr",
+    "tga",
+    "bevy_animation",
+    "free_camera",
+    "bevy_ui_widgets",
+    "bevy_remote",
+]
+
+[features]
+default = ["skinned_meshes"]
+skinned_meshes = []
+# Profiling builds (`make profile chrome` / `make profile tracy`). These are
+# opt-in cargo features rather than a commented-out line in the bevy feature
+# list above, so taking a profile never means editing tracked source — the
+# previous arrangement meant every capture started with a dirty working tree
+# and ended with a revert. Both pull in bevy's `trace`, which wraps every
+# system in a span: real overhead, which is why no shipped artifact carries it.
+#
+# chrome writes trace-<nanos>.json for `trace_summary`; tracy streams live to
+# the Tracy GUI and additionally uploads GPU zones from the render diagnostics
+# recorder, which chrome traces cannot show.
+profile-chrome = ["bevy/trace_chrome"]
+profile-tracy = ["bevy/trace_tracy"]
+
+[dev-dependencies]
+# Bevy reports failed commands through the `log` crate (bevy_ecs's error
+# handler), so the #430 regression test captures `log` records. Already in the
+# tree via bevy — this only makes it nameable from the tests.
+log = "0.4"

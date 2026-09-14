@@ -1,0 +1,19 @@
+[package]
+name = "sro_macro_derive"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Derive macros for the sro_macro serialization traits."
+license.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = "2.0.26"
+quote = "1"
+proc-macro2 = "1"
+proc-macro-error = "1"
+darling = "0.20.3"

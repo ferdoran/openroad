@@ -1,0 +1,33 @@
+name: constantinople
+char_start_offset: [95.0, -27.6, 654.0]
+char_end_offset: [29.0, -27.6, 644.0]
+cam_base: [81.0, 0.0, 105.0]
+cam_offset: [56.0, -12.0, 697.6]
+initial_camera_transforms:
+  - frame: 0.0
+    rx: 81.0
+    rz: 105.0
+    offset: [ 56.0, -12.0, 737.6 ]
+    rotation: [ -0.1, 0.1415, 0.0 ]
+  - frame: 1.5
+    rx: 81.0
+    rz: 105.0
+    offset: [ 56.0, -12.0, 697.6 ]
+    rotation: [ -0.1, 0.1415, 0.0 ]
+select_camera_transforms:
+  - frame: 0.0
+    rx: 81.0
+    rz: 105.0
+    offset: [ 56.0, -12.0, 697.6 ]
+    rotation: [ -0.1, 0.1415, 0.0 ]
+  - frame: 3.0
+    rx: 81.0
+    rz: 105.0
+    offset: [ 56.0, 0.0, 660.0 ]
+    rotation: [0.0, 0.1415, 0.0 ]
+create_camera_transforms:
+  - frame: 0.0
+    rx: 81.0
+    rz: 105.0
+    offset: [ 56.0, -12.0, 697.6 ]
+    rotation: [ -0.1, 0.1415, 0.0 ]

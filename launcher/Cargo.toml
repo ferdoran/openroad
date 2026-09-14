@@ -1,0 +1,23 @@
+[package]
+name = "launcher"
+version.workspace = true
+edition = "2024"
+authors.workspace = true
+repository.workspace = true
+description = "Standalone GUI launcher for the OpenRoad client."
+license.workspace = true
+
+[dependencies]
+bevy = { workspace = true }
+bevy_pk2 = { path = "../bevy_pk2" }
+byteorder = "1"
+ddsfile = "0.5"
+dotenvy = "0.15"
+futures-lite = "2.5"
+iced = { version = "0.13", features = ["image", "svg", "markdown"] }
+image = { version = "0.25", features = ["dds"] }
+rfd = "0.14"
+rand = "0.10.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "2"

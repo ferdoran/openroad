@@ -1,0 +1,11 @@
+# user-supplied SRO archives — never committed
+*.pk2
+
+# Cursors decoded from the user's own PK2s stay out of the tree by default.
+# The three below are ours (AI-generated, see .raw/Cursors.png) and ARE tracked,
+# so they are exempted explicitly rather than left contradicting this rule.
+cursors/*.cur
+cursors/*.png
+!cursors/Cursor3.png
+!cursors/cursor_attack.png
+!cursors/cursor_talk.png

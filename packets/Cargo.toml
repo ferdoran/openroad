@@ -1,0 +1,19 @@
+[package]
+name = "packets"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Silkroad Online network packet types and opcode wiring."
+license.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bevy = { workspace = true }
+bytes = { workspace = true }
+byteorder = { workspace = true }
+thiserror = { workspace = true }
+paste = "1"
+sro_macro = { path = "../sro_macro" }
+sro_macro_derive = { path = "../sro_macro_derive" }

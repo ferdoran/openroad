@@ -1,0 +1,231 @@
+# Cut a release: bump the workspace version, build all three targets, tag, publish.
+#
+# IDEA. The version lives in exactly one place — `[workspace.package] version` in the
+# root Cargo.toml, inherited by all seven crates — and this workflow owns it. You pick a
+# bump level; it rewrites Cargo.toml, refreshes Cargo.lock (committed on purpose, see
+# .gitignore), pushes that commit to main, builds the three targets FROM THAT COMMIT,
+# and only then creates the tag and the GitHub Release. Nothing else in the repo writes
+# the version, so cargo and the tag cannot disagree.
+#
+# ORDERING — the tag is created LAST, and that is deliberate. If a build fails, main is
+# left carrying a version-bump commit with no tag and no Release: untidy, but every
+# published tag is guaranteed to point at a tree that actually compiled on all three
+# platforms. Recover by re-dispatching (it bumps again). Tagging first would trade that
+# for a tag pointing at a broken build plus two things to clean up by hand.
+#
+# The build jobs are the reusable build-{linux,windows,macos}.yml workflows, called with
+# the version and the bump commit's sha. Passing the sha is load-bearing: a called
+# workflow checks out the TRIGGERING ref by default, which is main as it was before the
+# bump commit existed — without it the release would ship artifacts built from the
+# pre-bump tree and named with the post-bump version.
+#
+# This is the ONLY workflow in this repo that writes to the repository. It is still not
+# a merge gate, and it does not run `make ci`: the three builds are the only check, so
+# a release can ship code whose tests were never run in CI (BACKLOG EP-02.1).
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Which part of the semver to increment (ignored when `version` is set)'
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: 'Exact X.Y.Z to release (wins over `bump`)'
+        type: string
+        required: false
+      dry_run:
+        description: 'Rehearse: compute the version and build, but push, tag and publish nothing'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never two releases at once, and never cancel one in flight — a cancelled release can
+  # leave a pushed bump commit with no tag.
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      # A dry run is allowed from any branch so the whole thing can be rehearsed before
+      # merge; a real release comes off main only.
+      - name: Refuse to release from anywhere but main
+        if: ${{ github.ref != 'refs/heads/main' && !inputs.dry_run }}
+        run: |
+          echo "::error::releases are cut from main only (got ${{ github.ref }})"
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # tags included — the existing-tag check needs them
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Compute the next version
+        id: bump
+        env:
+          IN_VERSION: ${{ inputs.version }}
+          IN_BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          CURRENT="$(python3 scripts/bump_version.py --print)"
+          if [ -n "$IN_VERSION" ]; then
+            VERSION="$(python3 scripts/bump_version.py --set "$IN_VERSION")"
+          else
+            VERSION="$(python3 scripts/bump_version.py --bump "$IN_BUMP")"
+          fi
+          # Going backwards would put an older tag on top of newer code. `sed -n 1p`
+          # rather than `head -1`: head exits after one line and can SIGPIPE sort, which
+          # `pipefail` would then turn into a spurious step failure.
+          OLDEST="$(printf '%s\n%s\n' "$CURRENT" "$VERSION" | sort -V | sed -n 1p)"
+          if [ "$VERSION" != "$CURRENT" ] && [ "$OLDEST" != "$CURRENT" ]; then
+            echo "::error::requested version $VERSION is older than the current $CURRENT"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$VERSION" = "$CURRENT" ]; then
+            # Legitimate: the first release of an untagged version needs no bump at all.
+            echo "releasing the current version $VERSION as-is — no bump commit needed"
+          else
+            echo "$CURRENT -> $VERSION"
+          fi
+          echo "tag: v$VERSION"
+
+      # A re-dispatch at a version that already shipped must fail loudly rather than
+      # move a tag out from under a published Release.
+      - name: Refuse to reuse an existing tag
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::tag v$VERSION already exists"
+            exit 1
+          fi
+
+      - name: Bump Cargo.toml and refresh Cargo.lock
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/bump_version.py --set "$VERSION" --write
+          # The lock carries a version for each of the seven workspace members; without
+          # this the committed tree would be internally inconsistent.
+          cargo update --workspace
+          git diff --stat
+
+      - name: Commit and push the version bump
+        id: commit
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "dry run — discarding the bump; the builds will use the un-bumped tree"
+            git checkout -- Cargo.toml Cargo.lock
+          else
+            git config user.name  'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add Cargo.toml Cargo.lock
+            # Re-releasing the version already in Cargo.toml is a legitimate case — the
+            # first release of an untagged 0.1.0 needs no bump — and then there is
+            # nothing to commit and only the tag is new. `git commit` exits 1 on an
+            # empty index, so this must be checked rather than run blindly.
+            if git diff --cached --quiet; then
+              echo "Cargo.toml is already at $VERSION — no bump commit; tagging HEAD"
+            else
+              git commit -m "chore(release): v$VERSION"
+              git push origin HEAD:main
+            fi
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: prepare
+    uses: ./.github/workflows/build-linux.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      ref: ${{ needs.prepare.outputs.sha }}
+
+  windows:
+    needs: prepare
+    uses: ./.github/workflows/build-windows.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      ref: ${{ needs.prepare.outputs.sha }}
+
+  macos:
+    needs: prepare
+    uses: ./.github/workflows/build-macos.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      ref: ${{ needs.prepare.outputs.sha }}
+
+  publish:
+    needs: [prepare, linux, windows, macos]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: openroad-*
+          merge-multiple: true
+
+      # This is the step that makes the zips durable and shareable, so the PK2 guard the
+      # build jobs already applied is re-run here rather than trusted.
+      - name: Verify the artifacts
+        run: |
+          set -euo pipefail
+          ls -la artifacts
+          COUNT="$(find artifacts -maxdepth 1 -name '*.zip' | wc -l)"
+          if [ "$COUNT" -ne 3 ]; then
+            echo "::error::expected 3 zips, found $COUNT"
+            exit 1
+          fi
+          for z in artifacts/*.zip; do
+            # Capture first: a piped `unzip | grep` hands the status to grep, so an
+            # unreadable zip would read as "no PK2 found". This guard fails closed.
+            LISTING="$(unzip -l "$z")"
+            printf '%s\n' "$LISTING"
+            if printf '%s\n' "$LISTING" | grep -qi '\.pk2'; then
+              echo "::error::SRO asset found in $z — refusing to publish"
+              exit 1
+            fi
+          done
+
+      # `gh release create` creates the tag at --target itself, so there is no separate
+      # tag push. --generate-notes builds the notes from the commits since the last tag;
+      # there is no CHANGELOG in this repo to draw from.
+      - name: Tag and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh release create "v$VERSION" \
+            --target "$SHA" \
+            --title "v$VERSION" \
+            --generate-notes \
+            artifacts/*.zip
+          echo "published v$VERSION at $SHA"
