@@ -111,6 +111,15 @@ make perf attribute SECS=3               # per-subsystem frame-cost table (see b
 `DiagnosticsStore` as `{path: {value, avg, smoothed}}`:
 
 - `fps`, `frame_time`, `frame_count`, `entity_count` — Bevy's built-ins.
+- `frame_time/max_window` — the worst single frame in the same ~120-frame
+  history `frame_time`'s own `avg`/`smoothed` are computed from. Both of
+  those are means, so a single hitch buried in an otherwise-smooth window
+  barely moves either one; read this *against* `frame_time.avg` in the same
+  snapshot — close together means genuinely smooth, `max_window` far above
+  `avg` means a spike happened recently and the average hid it. This is the
+  frame-*pacing* signal `avg`/`smoothed` can't give you; see
+  `client/src/plugins/diagnostics.rs:frame_time_max_window_system`. Also on
+  the in-game corner panel as `frame max`.
 - `world_counts/*` — per-category entity counters (terrain blocks/tiles, map
   objects, mesh parts, effects, particles, bones, …) plus load/gating gauges:
   `loading_compounds`, `loading_resources` (in-flight object loads),
@@ -308,6 +317,187 @@ What to read off it:
 - **Where `prepare_windows` blocks.** It is a swapchain acquire, so it shows up
   as a long main-thread wait either way; the GPU track says whether the GPU was
   saturated underneath it (fill-bound) or idle (a stall to find).
+
+## Worked example: MSAA is the `prepare_windows` lever, confirmed
+
+A 2026-09-16 Tracy capture found `prepare_windows` costing ~8.7-11ms/frame —
+13-17% of frame time by itself — with the GPU only ~40-50% utilized
+underneath it (`main_opaque_pass_3d`'s own GPU time was a few ms, nowhere
+near the CPU-side wait). Opening the capture in the Tracy viewer and
+inspecting the worker-thread tracks during a `PostUpdate`/`Render` window
+confirmed `prepare_windows` runs as a dispatched task on the compute task
+pool (not a dedicated render thread) and is consistently the single widest
+block among all parallel work that frame — i.e. it is a real cost, not a
+measurement artifact.
+
+**`graphics.msaa: 1` (`Msaa::Off`, see `MsaaSamples::to_msaa` in
+`client/src/plugins/config/graphics.rs`) measurably shrinks it.** A/B in the
+deterministic `SCENE=world` sandbox (not a live server — see the caveat
+below), `dev_tools: false`, both runs Tracy-captured:
+
+| metric | msaa: 2 | msaa: 1 (off) | delta |
+|---|---|---|---|
+| FPS | 41.2 | 46.6 | +13% |
+| `prepare_windows` | 11.02 ms/frame | 8.79 ms/frame | −20% |
+| `schedule{name=Render}` self | 14.29 ms/frame | 12.11 ms/frame | −15% |
+| `sub app{name=RenderExtractApp}` | 11.99 ms/frame | 9.87 ms/frame | −18% |
+| `msaa_writeback` GPU pass | 0.93 ms/frame | absent | the resolve step itself disappears |
+
+The mechanism: `msaa_writeback` (the MSAA resolve pass) vanishes entirely at
+`Msaa::Off` since there is nothing to downsample, and the swapchain-acquire
+wait drops right along with it — `prepare_windows`'s cost tracks GPU render
+workload, and MSAA is a direct lever on that workload, same axis the `msaa`
+config comment already named ("the single biggest frame-time win available"
+on fill-limited hardware). FXAA (already always-on, independent of `msaa`,
+~2ms/frame either way per its own GPU zone) keeps doing edge AA on top, so
+`msaa: 1` is not "no AA", it is "no MSAA, FXAA only".
+
+**Caveat that cost an iteration**: the same A/B run once against a live
+server capture (`SceneState::GameWorld`) came back *backwards*
+(`prepare_windows` higher at `msaa: 1`, lower FPS) — a real result, just not
+of the variable being tested. `main_opaque_pass_3d`'s raw GPU time had nearly
+doubled between the two captures, which MSAA alone cannot cause (it
+multiplies per-sample cost, not geometry drawn); the honest read is that the
+second capture simply hit a heavier moment on a shared, non-reproducible
+server (more nearby players/mobs, different terrain-streaming state). Any
+config A/B needs a deterministic scene (`SCENE=world` or `SCENE=skills`) to
+mean anything — a live-server capture is fine for "what does a real session
+cost" but not for isolating one setting's effect.
+
+## Worked example: water quality is a real, confirmed lever
+
+A 2026-09-16 A/B in the deterministic `SCENE=world` sandbox (`dev_tools:
+false`, identical `world_counts/*` — same 4677 map objects, 1265 water, 3744
+terrain tiles both runs, confirming the sandbox loads the same content every
+launch) compared `graphics.water.quality: high` vs `low`, restarting between
+each (this setting is read once at `OnExit(GameState::Loading)` in
+`map::setup_terrain_mesh`, not live-toggleable):
+
+| metric | high (default) | low | delta |
+|---|---|---|---|
+| `frame_time.avg` | ~20-21 ms | ~19.4 ms | ~5-8% faster |
+| `fps.avg` | ~48-50 | ~52 | +~8% |
+| `render_phase/transmissive_3d/draws` | 2 | **0** | mechanism confirmed |
+
+The `transmissive_3d` draw count dropping to exactly 0 at Low is the direct
+mechanistic proof: Low never enters Bevy's Transmissive phase at all (it uses
+`AlphaMode::Blend` instead — see `client/src/plugins/map/mod.rs:125-138`),
+so the full-screen `view_transmission_texture` copy and the lost early-Z that
+High pays "whenever ANY water is on screen" are both gone entirely, not just
+reduced. This test location only had 2 transmissive draws in view, so treat
+the ~8% figure as a floor — a view with more water on screen should show a
+larger gap, since the fixed per-frame costs (the texture copy, opting out of
+the depth prepass) are paid once regardless of how much water is visible,
+while the win compounds with how much *other* geometry avoids losing early-Z
+because of it.
+
+Reproduced twice (high → low → high) with consistent readings each time.
+
+## Worked example: shadows — a real but modest lever
+
+Same session, same sandbox, live-toggled via BRP (no restart needed —
+`RenderDebugSettings.enable_shadows` is genuinely live despite `make perf
+attribute` excluding it; see the field's own doc comment in
+`client/src/plugins/dev/render_debug.rs:204-209`). `enable_shadows: true`
+(the runtime-seeded value from `graphics.shadows.enabled`, not the struct's
+`false` default) vs `false`, reproduced twice (on → off → on):
+
+| | on | off |
+|---|---|---|
+| `frame_time.avg` | ~20.1-20.3 ms | ~19.0 ms |
+| `fps.avg` | ~50.0-50.2 | ~53.4 |
+
+A consistent ~5-7% frame-time reduction, real but well short of an
+MSAA-or-water-sized win — this scene's 2 scoped vanilla-mode cascades
+(`map::sun_cascade_config`) apparently don't cost much here. Worth
+retesting in a scene with more shadow-casting geometry in view before
+concluding this is capped everywhere.
+
+**Foliage `view_distance` (300 and 0/unlimited, vs the default 1920) showed
+no measurable difference** at this test location — frame_time stayed within
+~1ms of baseline at every setting. Not necessarily a dead end: this
+particular camera position may simply not have much foliage in view: retest
+somewhere foliage-dense (a grass field, not open terrain) before ruling it
+out. Confirmed live-toggleable with zero rebuild either way (`VisibilityRange`
+swap, `client/src/plugins/map/foliage/mod.rs:211-262`), so re-testing it is
+cheap whenever there's a better vantage point.
+
+## Worked example: `frame_time/max_window` catches a real region-crossing hitch
+
+`frame_time.avg`/`.smoothed` are both means, so a single hitch buried in an
+otherwise-smooth window barely moves either one — the exact frame-*pacing*
+blind spot `frame_time/max_window` (see above) exists to close. A
+2026-09-16 live-server session (`SceneState::GameWorld`, `dev_tools: false`,
+polling `openroad/diagnostics` at ~1.5 Hz while actually playing) caught two
+real spikes this way:
+
+| time | `frame_time.avg` | `frame_time/max_window` | `world_counts/map_objects` | `world_counts/terrain_tiles` |
+|---|---|---|---|---|
+| 21:03:38 | 24.5 ms | 106 ms | 4607 | 3708 |
+| 21:03:45 | 31.4 ms | **162 ms** | **4390** ↓ | **3168** ↓ |
+| 21:03:47-53 | 28-32 ms | **208 ms** (peak, 7.3x avg) | 4535 ↑ | 3420 ↑ |
+| 21:04:28-35 | 26-29 ms | 66-68 ms (2.5x avg) | 4873→4878 ↑ | 3384→3420 |
+
+`map_objects`/`terrain_tiles` dropping then partially recovering is the
+signature of crossing a region boundary: old regions unloading behind the
+player, new ones loading ahead. `frame_time.avg` moved by single-digit
+milliseconds across this whole window — a 208 ms frame was completely
+invisible to it.
+
+**`world_counts/terrain_building` stayed at 0 throughout both spikes.** That
+rules out the mesh-*build* stage (`GROUP_BUILDS_PER_FRAME` is working
+correctly — nothing ever queued) and narrows the cause to the spawn/despawn
+side of terrain streaming: `load_terrain_objects_system`'s unbounded
+per-region object-spawn loop and/or the unbounded despawn in
+`load_terrain_dynamically`'s unload pass (`client/src/plugins/map/objects.rs`,
+`client/src/plugins/map/terrain/mod.rs`) — the same systems a code-review
+pass had already flagged as unbounded-consumers-downstream-of-a-budget
+*before* this capture, now confirmed against a real spike instead of resting
+on code review alone.
+
+**Fixed (same session).** Applied the `GROUP_BUILDS_PER_FRAME` idiom to both
+stages: `OBJECT_SPAWNS_PER_FRAME` (`client/src/plugins/map/objects.rs`,
+`load_terrain_objects_system`) caps object spawns per frame, leaning on the
+existing `SpawnedMapObjects` dedup so a region that doesn't finish this frame
+is safely re-walked next frame (only newly-loaded regions transition to
+`TerrainLoadState::Completed`, and only once fully drained);
+`REGION_UNLOADS_PER_FRAME` (`client/src/plugins/map/terrain/mod.rs`, the
+unload pass in `load_terrain_dynamically`) caps region despawns per frame —
+`out_of_range` is recomputed fresh every run, so a deferred region is simply
+re-evaluated (and despawned once budget allows) the next frame, no new state
+needed.
+
+Re-measured with the identical method (live server, `dev_tools: false`,
+`pace_poll.js` polling `openroad/diagnostics` while crossing regions):
+
+| | before | after |
+|---|---|---|
+| Peak `frame_time/max_window` | **207.68 ms** | **58.46 ms** |
+| Peak ratio vs `frame_time.avg` | 7.33x | 2.41x |
+
+`map_objects`/`terrain_tiles` still showed the same load/unload churn in the
+after-capture (3959↔4887, confirming real boundary crossings happened), so
+this is a like-for-like comparison — the streaming work didn't go away, it's
+just spread across enough frames that no single one spikes nearly as badly.
+~3.6x reduction in the worst observed frame. 58 ms is still ~2x the average,
+so `OBJECT_SPAWNS_PER_FRAME`/`REGION_UNLOADS_PER_FRAME` (currently 64 and 2)
+have room to tune tighter if a smoother result is wanted — start there
+before looking elsewhere if this needs another pass.
+
+## Gotcha: a background `cargo`/`rustc` build skews every reading
+
+Discovered mid-session the hard way: a `make perf fps`/`snapshot` reading can
+silently include CPU contention from an unrelated background compile running
+on the same machine. A shadows toggle once appeared to make frame time
+*worse* by 2-3x and kept climbing over several readings — restoring the
+setting didn't recover it either, which is what exposed the real cause:
+leftover `rustc.exe`/`cargo.exe` processes from an earlier crashed build were
+still running and starving the client of CPU. Killing them dropped
+`frame_time.avg` from ~90ms back to ~19ms with no config change at all.
+**Before trusting any BRP perf delta, check `tasklist` (or equivalent) for
+stray `rustc`/`cargo`/`link` processes first** — a real effect and "something
+else is compiling in the background" look identical in the numbers, and only
+one of them is what you're testing.
 
 ## Offline analysis of samples
 

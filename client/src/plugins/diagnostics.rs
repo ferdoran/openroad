@@ -88,6 +88,18 @@ pub const TERRAIN_BUILDING_COUNT: DiagnosticPath =
 // Sizes of the dedup/registry HashMaps (mesh, bind-pose, material and
 // map-object caches). Growth that never plateaus while revisiting the same
 // area = a cache leak; sampled at 4 Hz, that's all the resolution needed.
+// `frame_time`'s own `avg`/`smoothed` are both means, so a single 200 ms hitch
+// buried in 120 otherwise-smooth frames barely moves either one — exactly the
+// frame-pacing (stutter) signal the rest of this dump can't see, only frame
+// *rate*. This reads the same 120-sample history `FrameTimeDiagnosticsPlugin`
+// already keeps (`bevy_diagnostic::DEFAULT_MAX_HISTORY_LENGTH`) and reports its
+// max instead of its mean, so `avg` vs `max_window` read together over the same
+// window is the tell: close together means genuinely smooth, `max_window` far
+// above `avg` means a spike happened in roughly the last `avg`-many frames'
+// worth of time and got averaged away everywhere else.
+pub const FRAME_TIME_MAX_WINDOW: DiagnosticPath =
+    DiagnosticPath::const_new("frame_time/max_window");
+
 pub const SRO_MESH_CACHE: DiagnosticPath = DiagnosticPath::const_new("cache_counts/sro_meshes");
 pub const SRO_BIND_POSE_CACHE: DiagnosticPath =
     DiagnosticPath::const_new("cache_counts/sro_bind_poses");
@@ -115,6 +127,7 @@ impl Plugin for DiagnosticsPlugin {
             .register_diagnostic(Diagnostic::new(MESH_PART_COUNT).with_smoothing_factor(0.0))
             .register_diagnostic(Diagnostic::new(OTHER_COUNT).with_smoothing_factor(0.0))
             .register_diagnostic(Diagnostic::new(TERRAIN_BUILDING_COUNT).with_smoothing_factor(0.0))
+            .register_diagnostic(Diagnostic::new(FRAME_TIME_MAX_WINDOW).with_smoothing_factor(0.0))
             .register_diagnostic(Diagnostic::new(SRO_MESH_CACHE).with_smoothing_factor(0.0))
             .register_diagnostic(Diagnostic::new(SRO_BIND_POSE_CACHE).with_smoothing_factor(0.0))
             .register_diagnostic(
@@ -142,6 +155,7 @@ impl Plugin for DiagnosticsPlugin {
                     mesh_part_count_system,
                     other_count_system,
                     terrain_building_count_system,
+                    frame_time_max_window_system,
                 ),
             );
 
@@ -253,6 +267,19 @@ fn terrain_building_count_system(mut diagnostics: Diagnostics, states: Query<&Te
             .filter(|s| matches!(s, TerrainLoadState::BuildingMeshes { .. }))
             .count() as f64
     });
+}
+
+/// Max of `FrameTimeDiagnosticsPlugin::FRAME_TIME`'s own history, over the
+/// same window its `avg`/`smoothed` are computed from — see [`FRAME_TIME_MAX_WINDOW`].
+/// Reads `DiagnosticsStore` rather than tracking its own buffer: the history
+/// this needs already exists, so a second one would just be two copies of the
+/// same 120 floats drifting by up to a frame.
+fn frame_time_max_window_system(store: Res<DiagnosticsStore>, mut diagnostics: Diagnostics) {
+    let Some(frame_time) = store.get(&FrameTimeDiagnosticsPlugin::FRAME_TIME) else {
+        return;
+    };
+    let max = frame_time.values().copied().fold(0.0_f64, f64::max);
+    diagnostics.add_measurement(&FRAME_TIME_MAX_WINDOW, || max);
 }
 
 /// The caches are `Option<Res<..>>` because test scenes without `MapPlugin` /
@@ -489,6 +516,15 @@ fn stats_text_update_system(
         let unit = if is_gpu { "gpu" } else { "cpu" };
         let label = format!("{} {unit}", short_pass_name(&pass));
         lines.push_str(&format!("{label:<16}{value:>7.2}\n"));
+    }
+    // Worst single frame in the same ~120-frame window `smoothed`/`avg` use —
+    // see `frame_time_max_window_system`. Far above the FPS row's own number
+    // means a hitch happened recently and the average alone hid it.
+    if let Some(max) = diagnostics
+        .get(&FRAME_TIME_MAX_WINDOW)
+        .and_then(|d| d.value())
+    {
+        lines.push_str(&format!("{:<16}{max:>6.1}ms\n", "frame max"));
     }
     // Net entity drift over the diagnostic's history window (~120 frames).
     // Steady-state churn (spawn N / despawn N per second) is invisible here —

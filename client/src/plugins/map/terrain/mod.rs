@@ -264,6 +264,18 @@ pub fn preload_terrain_region(
     }
 }
 
+/// Region despawns budgeted per frame. Crossing a region boundary can flag a
+/// whole ring/row of regions out-of-range at once, and `despawn()` recursively
+/// tears down each one's entire mesh/object/compound subtree — unthrottled,
+/// this was half of the ~208ms region-crossing hitch measured live (the
+/// other half was the mirrored unbudgeted spawn burst, see
+/// `OBJECT_SPAWNS_PER_FRAME` in `objects.rs`), documented in
+/// `docs/perf-remote.md`. `out_of_range` is recomputed fresh from the
+/// camera's position every time this system runs, so a region that misses
+/// its budget this frame is simply re-evaluated (and despawned once budget
+/// allows) the next one — no extra state needed.
+const REGION_UNLOADS_PER_FRAME: i32 = 2;
+
 pub fn load_terrain_dynamically(
     camera_query: Query<
         (&Transform, &Camera, Has<DistanceFog>),
@@ -339,6 +351,7 @@ pub fn load_terrain_dynamically(
         // fog cover), but only regions not yet fully behind the opaque fog are rendered —
         // see `region_visibility`. Hiding the region root hides its whole subtree
         // (ground groups, map objects, water planes).
+        let mut unload_budget = REGION_UNLOADS_PER_FRAME;
         terrain_query
             .iter_mut()
             .for_each(|(entity, terrain, mut visibility, preloaded)| {
@@ -349,7 +362,8 @@ pub fn load_terrain_dynamically(
                     || t_x > unload_max_x
                     || t_z < unload_min_z
                     || t_z > unload_max_z;
-                if out_of_range && preloaded.is_none() {
+                if out_of_range && preloaded.is_none() && unload_budget > 0 {
+                    unload_budget -= 1;
                     trace!(
                         "Unload TerrainId {:?}",
                         TerrainId::from_x_z(t_x as u8, t_z as u8)
