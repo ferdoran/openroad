@@ -13,6 +13,7 @@ const HISTORY_SECS: f32 = 10.0;
 const MIN_GRAPH_FPS: f32 = 30.0;
 const GRAPH_SIZE: egui::Vec2 = egui::vec2(360.0, 150.0);
 const GRAPH_MARGIN: f32 = 8.0;
+const RECORDING_DURATIONS: [f32; 3] = [10.0, 30.0, 60.0];
 
 pub(crate) struct FpsGraphPlugin;
 
@@ -34,6 +35,7 @@ struct FpsSample {
 #[derive(Resource, Default)]
 struct FpsGraphHistory {
     samples: VecDeque<FpsSample>,
+    recorder: FpsRecorder,
 }
 
 impl FpsGraphHistory {
@@ -50,10 +52,12 @@ impl FpsGraphHistory {
             self.samples.pop_front();
         }
         if dt_secs > f32::EPSILON {
-            self.samples.push_back(FpsSample {
+            let sample = FpsSample {
                 age_secs: 0.0,
                 fps: 1.0 / dt_secs,
-            });
+            };
+            self.samples.push_back(sample);
+            self.recorder.push_sample(sample.fps, dt_secs);
         }
     }
 
@@ -68,6 +72,102 @@ impl FpsGraphHistory {
             .fold(MIN_GRAPH_FPS, f32::max)
             .ceil()
     }
+
+    fn min_max_fps(&self) -> Option<(f32, f32)> {
+        self.samples
+            .iter()
+            .map(|sample| sample.fps)
+            .fold(None, |range, fps| match range {
+                Some((min, max)) => Some((min.min(fps), max.max(fps))),
+                None => Some((fps, fps)),
+            })
+    }
+}
+
+struct FpsRecorder {
+    selected_secs: f32,
+    active: Option<ActiveRecording>,
+    completed: Option<CompletedRecording>,
+}
+
+impl Default for FpsRecorder {
+    fn default() -> Self {
+        Self {
+            selected_secs: RECORDING_DURATIONS[0],
+            active: None,
+            completed: None,
+        }
+    }
+}
+
+impl FpsRecorder {
+    fn selected_secs(&self) -> f32 {
+        self.selected_secs
+    }
+
+    fn start(&mut self) {
+        self.active = Some(ActiveRecording::new(self.selected_secs()));
+        self.completed = None;
+    }
+
+    fn push_sample(&mut self, fps: f32, dt_secs: f32) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        active.push_sample(fps, dt_secs);
+        if active.elapsed_secs >= active.target_secs {
+            self.completed = active.finish();
+            self.active = None;
+        }
+    }
+}
+
+struct ActiveRecording {
+    target_secs: f32,
+    elapsed_secs: f32,
+    frames: u32,
+    min_fps: f32,
+    max_fps: f32,
+}
+
+impl ActiveRecording {
+    fn new(target_secs: f32) -> Self {
+        Self {
+            target_secs,
+            elapsed_secs: 0.0,
+            frames: 0,
+            min_fps: f32::INFINITY,
+            max_fps: 0.0,
+        }
+    }
+
+    fn push_sample(&mut self, fps: f32, dt_secs: f32) {
+        self.elapsed_secs += dt_secs;
+        self.frames += 1;
+        self.min_fps = self.min_fps.min(fps);
+        self.max_fps = self.max_fps.max(fps);
+    }
+
+    fn finish(&self) -> Option<CompletedRecording> {
+        if self.frames == 0 || self.elapsed_secs <= f32::EPSILON {
+            return None;
+        }
+        Some(CompletedRecording {
+            target_secs: self.target_secs,
+            elapsed_secs: self.elapsed_secs,
+            average_fps: self.frames as f32 / self.elapsed_secs,
+            min_fps: self.min_fps,
+            max_fps: self.max_fps,
+        })
+    }
+}
+
+struct CompletedRecording {
+    target_secs: f32,
+    elapsed_secs: f32,
+    average_fps: f32,
+    min_fps: f32,
+    max_fps: f32,
 }
 
 fn fps_graph_window(
@@ -93,7 +193,61 @@ fn fps_graph_window(
             });
             ui.add_space(4.0);
             draw_fps_graph(ui, &history);
+            ui.add_space(4.0);
+            if let Some((min, max)) = history.min_max_fps() {
+                ui.label(format!("10s min/max: {min:.1} / {max:.1} FPS"));
+            } else {
+                ui.label("10s min/max: - / - FPS");
+            }
+            ui.add_space(6.0);
+            recording_controls(ui, &mut history.recorder);
         });
+}
+
+fn recording_controls(ui: &mut egui::Ui, recorder: &mut FpsRecorder) {
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_label("Record for")
+            .selected_text(format!("{:.0} seconds", recorder.selected_secs()))
+            .show_ui(ui, |ui| {
+                for seconds in RECORDING_DURATIONS {
+                    ui.selectable_value(
+                        &mut recorder.selected_secs,
+                        seconds,
+                        format!("{seconds:.0} seconds"),
+                    );
+                }
+            });
+
+        let label = if recorder.active.is_some() {
+            "Recording..."
+        } else {
+            "Start"
+        };
+        if ui
+            .add_enabled(recorder.active.is_none(), egui::Button::new(label))
+            .clicked()
+        {
+            recorder.start();
+        }
+    });
+
+    if let Some(active) = recorder.active.as_ref() {
+        ui.label(format!(
+            "Recording: {:.1} / {:.0}s",
+            active.elapsed_secs.min(active.target_secs),
+            active.target_secs
+        ));
+    }
+
+    if let Some(completed) = recorder.completed.as_ref() {
+        ui.label(format!(
+            "Last {:.0}s recording ({:.1}s captured)",
+            completed.target_secs, completed.elapsed_secs
+        ));
+        ui.label(format!("Average FPS: {:.1}", completed.average_fps));
+        ui.label(format!("Min FPS: {:.1}", completed.min_fps));
+        ui.label(format!("Max FPS: {:.1}", completed.max_fps));
+    }
 }
 
 fn draw_fps_graph(ui: &mut egui::Ui, history: &FpsGraphHistory) {
@@ -219,5 +373,28 @@ mod tests {
             history.samples.back().map(|sample| sample.age_secs),
             Some(0.0)
         );
+    }
+
+    #[test]
+    fn min_max_fps_uses_the_kept_history() {
+        let mut history = FpsGraphHistory::default();
+        history.push_frame(Duration::from_millis(100));
+        history.push_frame(Duration::from_millis(50));
+
+        assert_eq!(history.min_max_fps(), Some((10.0, 20.0)));
+    }
+
+    #[test]
+    fn recorder_completes_with_total_metrics() {
+        let mut recorder = FpsRecorder::default();
+        recorder.selected_secs = 1.0;
+        recorder.start();
+        recorder.push_sample(10.0, 0.1);
+        recorder.push_sample(20.0, 0.9);
+
+        let completed = recorder.completed.as_ref().expect("recording completed");
+        assert_eq!(completed.average_fps, 2.0);
+        assert_eq!(completed.min_fps, 10.0);
+        assert_eq!(completed.max_fps, 20.0);
     }
 }
