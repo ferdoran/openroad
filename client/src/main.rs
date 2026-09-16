@@ -16,7 +16,7 @@ use bevy::prelude::*;
 use bevy::remote::RemotePlugin;
 use bevy_brp_extras::BrpExtrasPlugin;
 use bevy_egui::{EguiGlobalSettings, EguiPlugin, UiRenderOrder};
-use bevy_inspector_egui::quick::{StateInspectorPlugin, WorldInspectorPlugin};
+use bevy_inspector_egui::quick::StateInspectorPlugin;
 use bevy_tweening::TweeningPlugin;
 
 mod assets;
@@ -264,17 +264,19 @@ fn main() {
         );
     }
 
-    // Opt-in dev tooling (config.yaml `dev_tools`): the world inspector alone
+    // Opt-in dev tooling (config.yaml `dev_tools`): the stock world inspector
     // reflects every entity into egui each frame, which costs double-digit
-    // FPS with streamed terrain. EguiPlugin itself stays unconditional (the
-    // render-debug panels use it).
+    // FPS with streamed terrain — `plugins::dev::world_inspector` replaces it
+    // with a variant that only does that walk when its "Refresh" button is
+    // clicked. EguiPlugin itself stays unconditional (the render-debug panels
+    // use it).
     if dev_tools {
         app.add_plugins((
             // `.run_if(dev_windows_visible)` like every other inspector in the
             // tree: these two were the only ones the "dev" corner button could
             // not hide, so switching the dev windows off left the world
             // inspector — the most expensive of them — on screen.
-            WorldInspectorPlugin::new().run_if(plugins::dev::dev_windows_visible),
+            plugins::dev::world_inspector::ManualWorldInspectorPlugin,
             StateInspectorPlugin::<GameState>::default().run_if(plugins::dev::dev_windows_visible),
         ));
     }
