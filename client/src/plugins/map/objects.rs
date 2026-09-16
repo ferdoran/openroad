@@ -277,6 +277,18 @@ fn object_details<'a>(
     }
 }
 
+/// Object spawns budgeted per frame, across every region processed this
+/// call. A freshly-loaded region (`TerrainLoadState::LoadedMeshes`) can list
+/// hundreds of objects across its blocks/LOD groups, and spawning them all
+/// in one frame — on top of the mirrored despawn burst on the opposite side
+/// of the same crossing — was the ~208ms region-crossing hitch measured live
+/// and documented in `docs/perf-remote.md`. The mesh-build stage already
+/// solved this exact problem (`GROUP_BUILDS_PER_FRAME`, `terrain/mod.rs`);
+/// this is the same idiom for object spawning. Deferred objects cost nothing
+/// extra to retry: the cross-frame `SpawnedMapObjects` dedup below already
+/// makes re-walking a partially-spawned region safe.
+const OBJECT_SPAWNS_PER_FRAME: i32 = 64;
+
 pub fn load_terrain_objects_system(
     mut commands: Commands,
     mut query: Query<(Entity, &Terrain, &TerrainObjectData, &mut TerrainLoadState)>,
@@ -294,6 +306,7 @@ pub fn load_terrain_objects_system(
     let Some(object_info) = &object_info.object_info_index else {
         return;
     };
+    let mut budget = OBJECT_SPAWNS_PER_FRAME;
     query
         .iter_mut()
         .for_each(|(terrain_entity, terrain, object_data, mut load_state)| {
@@ -302,6 +315,11 @@ pub fn load_terrain_objects_system(
 
                 match load_state.as_ref() {
                     TerrainLoadState::LoadedMeshes => {
+                        // Only true once every object in this region has been
+                        // spawned (or was already); stays `LoadedMeshes` (retried
+                        // next frame) instead of advancing to `Completed` below
+                        // if the budget ran out partway through.
+                        let mut all_spawned = true;
                         object_data
                             .blocks
                             .iter()
@@ -317,7 +335,15 @@ pub fn load_terrain_objects_system(
                                             .0
                                             .get(&obj_key)
                                             .is_some_and(|&e| entities.contains(e));
-                                        if !already_spawned {
+                                        if already_spawned {
+                                            return;
+                                        }
+                                        if budget <= 0 {
+                                            all_spawned = false;
+                                            return;
+                                        }
+                                        budget -= 1;
+                                        {
                                             let (x, z) = object.region_id.to_x_z();
                                             let (cx, cz) = terrain.to_x_z();
                                             let dx = x as i32 - cx as i32;
@@ -399,7 +425,9 @@ pub fn load_terrain_objects_system(
                                     });
                                 });
                             });
-                        *load_state = TerrainLoadState::Completed
+                        if all_spawned {
+                            *load_state = TerrainLoadState::Completed;
+                        }
                     }
                     TerrainLoadState::None | TerrainLoadState::BuildingMeshes { .. } => {}
                     TerrainLoadState::Completed => {
