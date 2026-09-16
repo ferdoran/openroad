@@ -7,6 +7,7 @@ use crate::plugins::config::ClientConfig;
 use crate::AppMode;
 
 use crate::plugins::dev::aabb_lines::draw_debug_lines_for_aabb;
+use crate::plugins::dev::fps_graph::FpsGraphPlugin;
 use crate::plugins::dev::glass_ball::GlassballPlugin;
 use crate::plugins::dev::lighting::LightingPlugin;
 use crate::plugins::dev::navmesh_lines::{
@@ -22,10 +23,12 @@ pub mod aabb_lines;
 pub mod glass_ball;
 pub mod lighting;
 pub mod navmesh_lines;
+pub mod world_inspector;
 // pub: `map::objects::cull_fogged_objects` reads `RenderDebugSettings` to
 // stand down while the panel's render_objects toggle owns wrapper visibility
 mod auto_screenshot;
 mod cos_spawner;
+mod fps_graph;
 mod gm_commands;
 mod player_config;
 pub mod render_debug;
@@ -138,6 +141,7 @@ impl Plugin for DevPlugin {
                 TeleportPlugin,
                 cos_spawner::CosSpawnerPlugin,
                 gm_commands::GmCommandsPlugin,
+                FpsGraphPlugin,
             ));
             app.add_systems(Update, (spawn_dev_windows_button, on_dev_windows_button));
             // Both of these are bare-letter hotkey plugins: lighting adjusts
