@@ -8,6 +8,8 @@ use bevy::ecs::resource::Resource;
 
 use bevy_pk2::prelude::{Archive, Pk2Key};
 
+use crate::plugins::assets::fallback_reader::FallbackAssetReader;
+
 /// A shared handle on the opened Media.pk2 for consumers that need direct
 /// archive access (directory listings) outside the asset-server path — e.g.
 /// the minimap's `minimap_d` group discovery. Cloning shares the file handle
@@ -42,11 +44,26 @@ impl Plugin for SroAssetPlugin {
 
         let media_archive = Archive::open_or_panic(media_path, &key);
         app.insert_resource(MediaArchive(media_archive.clone()));
-        let media_reader = Box::new(media_archive);
-        let map_reader = Box::new(Archive::open_or_panic(map_path, &key));
-        let music_reader = Box::new(Archive::open_or_panic(music_path, &key));
-        let data_reader = Box::new(Archive::open_or_panic(data_path, &key));
-        let particles_reader = Box::new(Archive::open_or_panic(particles_path, &key));
+        // Wrapped in `FallbackAssetReader` so one missing `.ddj`/`.wav` file
+        // substitutes a warned-about placeholder instead of leaving its
+        // `LoadState` `Failed`, which would otherwise hang
+        // `bevy_asset_loader`'s `AssetCollection` gate — and therefore the
+        // loading screen — forever (see `fallback_reader` module docs).
+        let media_reader = Box::new(FallbackAssetReader {
+            inner: media_archive,
+        });
+        let map_reader = Box::new(FallbackAssetReader {
+            inner: Archive::open_or_panic(map_path, &key),
+        });
+        let music_reader = Box::new(FallbackAssetReader {
+            inner: Archive::open_or_panic(music_path, &key),
+        });
+        let data_reader = Box::new(FallbackAssetReader {
+            inner: Archive::open_or_panic(data_path, &key),
+        });
+        let particles_reader = Box::new(FallbackAssetReader {
+            inner: Archive::open_or_panic(particles_path, &key),
+        });
 
         app.register_asset_source(
             "media",
