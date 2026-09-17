@@ -112,24 +112,20 @@ graphics:
     power: 3.0 # fresnel falloff (mobile ships 3)
     mode: relative # relative = lit x (1 + rim), survives HDR; absolute = plain add
     strength: 1.0 # extra multiplier on the color alpha (headroom past 1.0)
-  # Terrain lighting A/B (also live in the render-debug panel):
-  # dynamic = PBR sun+ambient over the baked lightmap (current);
-  # flat_baked = no N·L but keeps the time-of-day tint;
-  # baked = albedo x lightmap only (mobile/original ground, no day/night).
+  # Vanilla vs. PBR lighting (hotkey N flips it live for the session without
+  # touching this file): vanilla = baked terrain lightmap + ambient lighting
+  # only, no directional light, no shadow cascades — SRO-faithful. pbr =
+  # dynamic cascaded shadows + PBR directional lighting, lightmap off.
+  render_mode: vanilla
   terrain:
-    lighting: dynamic
     lightmap_flip_v: false # V-axis calibration of the baked .t lightmap
-  # Dynamic sun shadows (cascaded shadow maps). With enabled true, hotkey
-  # N toggles between the faithful look (baked lightmap + only the player
-  # casting a crisp, player-scoped shadow — the default) and PBR
-  # (everything casts, no lightmap). Set enabled false to hard-disable
-  # shadow maps in both modes (measure cost with `make perf`).
-  # cascades/distance apply to PBR mode ONLY — vanilla always uses a
-  # built-in tight config around the player. Beware large distances: the
-  # map_size resolution is spread over the whole range, so huge values
-  # blur every shadow into a faint blob; ~600-1000 keeps PBR shadows
-  # sharp. map_size (power of two, default 2048) trades GPU memory for
-  # shadow crispness in both modes.
+  # Dynamic sun shadows (cascaded shadow maps), PBR mode ONLY — vanilla mode
+  # disables the Sun's shadow maps outright, regardless of this block. Set
+  # enabled false to hard-disable shadow maps in PBR mode too (measure cost
+  # with `make perf`). Beware large distances: the map_size resolution is
+  # spread over the whole range, so huge values blur every shadow into a
+  # faint blob; ~600-1000 keeps shadows sharp. map_size (power of two,
+  # default 2048) trades GPU memory for shadow crispness.
   shadows:
     enabled: true
     cascades: 2

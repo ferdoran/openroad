@@ -2,7 +2,7 @@ use std::f32::consts::PI;
 use std::time::Duration;
 
 use bevy::image::ImageLoaderSettings;
-use bevy::light::{CascadeShadowConfig, CascadeShadowConfigBuilder, DirectionalLightShadowMap};
+use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap};
 use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
 use bevy_asset_loader::prelude::{ConfigureLoadingState, LoadingStateAppExt, LoadingStateConfig};
@@ -260,65 +260,7 @@ pub fn generate_water_normal_mips(
     commands.remove_resource::<WaterNormalMapImage>();
 }
 
-/// The Sun's cascade config per render mode. Vanilla: only the player casts
-/// (`environment::apply_vanilla_shadow_casters`), so the maps only need to
-/// cover the camera→ground range (follow camera is 40..400 units out, plus
-/// pitch) — tight bounds keep the texels small and the character shadow
-/// crisp. PBR: everything casts, range comes from config; note huge distances
-/// spread the map thin (see the `ShadowSettings::distance` doc). Applied at
-/// Sun spawn here and re-inserted on mode flips by
-/// `environment::apply_render_mode` (a runtime `CascadeShadowConfig` insert
-/// takes effect the next frame).
-///
-/// The cascade COUNT is deliberately identical in both modes: growing
-/// `bounds.len()` on a live light panics in bevy_light's
-/// `check_dir_light_mesh_visibility` (the issue-#207 mechanism — stale
-/// per-thread queues sized for the old count are indexed unconditionally, so
-/// 2→3 cascades = index out of bounds). Only the depth range differs per mode.
-pub fn sun_cascade_config(
-    vanilla: bool,
-    shadows: &crate::plugins::config::graphics::ShadowSettings,
-) -> CascadeShadowConfig {
-    if vanilla {
-        vanilla_cascade_config(shadows, VANILLA_SHADOW_BASE_DISTANCE)
-    } else {
-        CascadeShadowConfigBuilder {
-            num_cascades: shadows.cascades.clamp(1, 4),
-            maximum_distance: shadows.distance.max(1.0),
-            ..default()
-        }
-        .build()
-    }
-}
-
-/// Baseline vanilla cascade range: covers the follow camera's full zoom
-/// (40..400 units) plus pitch with room to spare.
-pub const VANILLA_SHADOW_BASE_DISTANCE: f32 = 800.0;
-
-/// The vanilla cascade config at a given range. Cascades are scoped to the
-/// VIEW frustum, so a free/debug camera watching the player from afar needs a
-/// longer range than the follow camera —
-/// `environment::scale_vanilla_cascades` stretches `maximum_distance` to the
-/// player's view depth each frame and calls this. Cascade count comes from
-/// config in both modes (see `sun_cascade_config` on why it must not change).
-pub fn vanilla_cascade_config(
-    shadows: &crate::plugins::config::graphics::ShadowSettings,
-    maximum_distance: f32,
-) -> CascadeShadowConfig {
-    CascadeShadowConfigBuilder {
-        num_cascades: shadows.cascades.clamp(1, 4),
-        first_cascade_far_bound: 150.0,
-        maximum_distance: maximum_distance.max(VANILLA_SHADOW_BASE_DISTANCE),
-        ..default()
-    }
-    .build()
-}
-
-pub fn setup_lighting(
-    mut commands: Commands,
-    config: Res<crate::plugins::config::ClientConfig>,
-    env: Res<crate::plugins::environment::EnvironmentSettings>,
-) {
+pub fn setup_lighting(mut commands: Commands, config: Res<crate::plugins::config::ClientConfig>) {
     commands.insert_resource(GlobalAmbientLight {
         color: Color::WHITE,
         brightness: 100.0,
@@ -332,27 +274,40 @@ pub fn setup_lighting(
     commands.insert_resource(ClearColor(terrain::rendering::FOG_COLOR.into()));
 
     // Shadows come from config (`graphics.shadows`), scoped down: few, short
-    // cascades — the baked terrain lightmap carries distant shading, so the
-    // dynamic maps only need to cover the player's surroundings. The old
-    // 100k-unit default re-rendered all loaded terrain/objects per frame
-    // (the perf note on `RenderDebugSettings::enable_shadows`, which
-    // remains the live toggle on top of this).
+    // cascades — huge distances spread the map thin (see the
+    // `ShadowSettings::distance` doc). PBR-mode only: vanilla disables the
+    // Sun's shadow maps outright (`environment::apply_render_mode`), so this
+    // cascade config is simply inert there, not rescoped — the cascade COUNT
+    // is never changed at runtime because growing `bounds.len()` on a live
+    // light panics in bevy_light's `check_dir_light_mesh_visibility` (the
+    // issue-#207 mechanism — stale per-thread queues sized for the old count
+    // are indexed unconditionally).
     let shadows = &config.graphics.shadows;
+    let render_mode = config.graphics.render_mode;
     commands.insert_resource(DirectionalLightShadowMap {
         size: (shadows.map_size.max(512).next_power_of_two()) as usize,
     });
+    let is_pbr = render_mode == crate::plugins::config::graphics::RenderMode::Pbr;
     commands.spawn((
         DirectionalLight {
-            // The maps stay on in both render modes; the vanilla/PBR switch
-            // (`EnvironmentSettings.enabled`, hotkey N) instead decides who
-            // casts into them (player-only vs everything — see
-            // `environment::apply_vanilla_shadow_casters`) and how the
-            // cascades are scoped (`sun_cascade_config`).
-            shadow_maps_enabled: shadows.enabled,
-            illuminance: light_consts::lux::AMBIENT_DAYLIGHT,
+            // Vanilla mode wants no directional light and no shadow-cascade
+            // pass at all, not just a rescoped one — see
+            // `environment::apply_render_mode`, which flips both live on a
+            // mode change (hotkey N).
+            shadow_maps_enabled: is_pbr && shadows.enabled,
+            illuminance: if is_pbr {
+                light_consts::lux::AMBIENT_DAYLIGHT
+            } else {
+                0.0
+            },
             ..default()
         },
-        sun_cascade_config(env.enabled, shadows),
+        CascadeShadowConfigBuilder {
+            num_cascades: shadows.cascades.clamp(1, 4),
+            maximum_distance: shadows.distance.max(1.0),
+            ..default()
+        }
+        .build(),
         Transform::from_rotation(Quat::from_rotation_x(-PI / 4.)),
         crate::plugins::environment::Sun,
         Name::from("Sun"),

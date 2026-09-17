@@ -493,10 +493,7 @@ mod tests {
         assert_eq!(graphics.rim.power, 3.0);
         assert_eq!(graphics.rim.mode, super::graphics::RimMode::Relative);
         assert_eq!(graphics.rim.strength, 1.0);
-        assert_eq!(
-            graphics.terrain.lighting,
-            super::graphics::TerrainLightingConfig::Dynamic
-        );
+        assert_eq!(graphics.render_mode, super::graphics::RenderMode::Vanilla);
         assert!(!graphics.terrain.lightmap_flip_v);
         assert!(graphics.shadows.enabled);
         assert_eq!(graphics.shadows.cascades, 2);

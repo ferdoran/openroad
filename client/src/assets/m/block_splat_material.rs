@@ -142,16 +142,19 @@ pub struct TerrainAmbientRatioBuffer(pub Buffer);
 pub struct TerrainRenderParams {
     pub lightmap_flip_v: bool,
     pub lighting_mode: TerrainLightingMode,
-    /// Baked terrain lightmap on/off — owned by the environment plugin's
-    /// vanilla/PBR switch (`EnvironmentSettings.enabled`, hotkey N), NOT by
-    /// the render-debug panel; `on_settings_changed` carries the current
-    /// value through its rebuild instead of resetting it.
+    /// Baked terrain lightmap on/off — follows `graphics.render_mode`
+    /// (`Vanilla` = on) as a baseline (`apply_terrain_render_params`), with
+    /// the environment plugin's live hotkey-N override
+    /// (`EnvironmentSettings.mode`, `apply_render_mode`) able to flip it for
+    /// the current session without touching config. NOT owned by the
+    /// render-debug panel; `on_settings_changed` carries the current value
+    /// through its rebuild instead of resetting it.
     pub lightmap_enabled: bool,
-    /// Extra sun-shadow darkening on the lit ground (0 = none): the vanilla
-    /// player-shadow boost, env-owned like `lightmap_enabled` — set from
-    /// `EnvironmentSettings::vanilla_shadow_strength` in vanilla mode, 0 in
-    /// PBR mode (where apply_pbr_lighting's physically-based shadowing is
-    /// the whole story).
+    /// Extra sun-shadow darkening on the lit ground. Always 0 now — it stood
+    /// in for a vanilla-mode player shadow that vanilla no longer casts at
+    /// all (vanilla fully disables the Sun's shadow maps). Kept as a no-op
+    /// GPU-layout slot rather than reworking `terrain_splat.wgsl`'s uniform
+    /// layout for its removal.
     pub shadow_strength: f32,
     /// Tiling repeat factors for the five splat-scale codes `8·i`
     /// (`docs/formats/mapm-jmxvmapm.md`), index `i` = code/8, all
@@ -193,8 +196,8 @@ impl TerrainRenderParams {
     /// `[1].x` = lighting mode as float (shader branches on `< 0.5`/`< 1.5`),
     /// `[1].yzw` + `[2].xy` = the splat repeat factors for codes 0..32,
     /// `[2].z` = lightmap strength (1 = multiply baked lightmap into albedo,
-    /// 0 = off, PBR mode), `[2].w` = extra sun-shadow darkening (the vanilla
-    /// player-shadow boost, 0 = off).
+    /// 0 = off, PBR mode), `[2].w` = extra sun-shadow darkening — unused,
+    /// always 0 (see [`TerrainRenderParams::shadow_strength`]).
     /// Factors are clamped away from 0 — the shader divides by them.
     fn to_gpu(&self) -> [f32; 12] {
         let (scale_v, offset_v) = if self.lightmap_flip_v {
@@ -239,7 +242,10 @@ fn apply_terrain_render_params(
     config: Res<crate::plugins::config::ClientConfig>,
     mut params: ResMut<TerrainRenderParams>,
 ) {
-    *params = config.graphics.terrain.to_render_params();
+    *params = config
+        .graphics
+        .terrain
+        .to_render_params(config.graphics.render_mode);
 }
 
 pub struct TerrainAmbientRatioPlugin;

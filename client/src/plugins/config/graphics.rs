@@ -8,7 +8,27 @@
 //! actually lets those emitters read as "glowing" instead of "white".
 
 use bevy::post_process::bloom::Bloom;
+use bevy::reflect::Reflect;
 use serde::Deserialize;
+
+/// The two lighting modes the client can run, mutually exclusive — see
+/// [`crate::plugins::environment::EnvironmentSettings`] (the live/hotkey
+/// half) and `plugins::environment::apply_render_mode` (what each mode
+/// actually switches: the Sun's directional light + shadow maps, the terrain
+/// lightmap, the ambient model, and the terrain shader's lighting mode).
+/// `Reflect` (unlike this file's other config enums) because it also lives
+/// on `EnvironmentSettings`, which the dev inspector reflects.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, Reflect)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderMode {
+    /// SRO-faithful: baked terrain lightmap + ambient lighting only — no
+    /// directional light, no shadow cascades.
+    #[default]
+    Vanilla,
+    /// Dynamic cascaded shadows + PBR directional lighting over the terrain
+    /// (lightmap off).
+    Pbr,
+}
 
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct GraphicsSettings {
@@ -18,6 +38,9 @@ pub struct GraphicsSettings {
     pub sheen: SheenGraphicsSettings,
     #[serde(default)]
     pub rim: RimGraphicsSettings,
+    /// Vanilla vs. PBR lighting — see [`RenderMode`].
+    #[serde(default)]
+    pub render_mode: RenderMode,
     #[serde(default)]
     pub terrain: TerrainGraphicsSettings,
     #[serde(default)]
@@ -476,19 +499,20 @@ impl Default for PackFoliageSettings {
     }
 }
 
-/// Dynamic sun shadows via Bevy's cascaded shadow maps, scoped down (the
+/// Dynamic sun shadows via Bevy's cascaded shadow maps, **PBR mode only**
+/// (`RenderMode::Vanilla` disables the Sun's shadow maps entirely — the
 /// original has none beyond the baked terrain lightmap — gap #9 in
 /// `docs/rendering-mobile-shader-comparison.md`; acceptance per backlog
 /// EP-28.10 is a measured `make perf` budget). The render-debug panel's
-/// `enable_shadows` toggles them live on top of this master switch.
+/// `enable_shadows` toggles them live on top of this master switch, still
+/// PBR-mode only.
 #[derive(Deserialize, Debug, Clone)]
 #[serde(default)]
 pub struct ShadowSettings {
     pub enabled: bool,
-    /// Shadow cascade count, **PBR mode only** (vanilla uses a built-in
-    /// player-scoped cascade config — see `map::sun_cascade_config`). Bevy's
-    /// default 4 over a huge range re-renders all loaded terrain/objects
-    /// several times per frame; few short cascades keep the cost bounded.
+    /// Shadow cascade count, **PBR mode only**. Bevy's default 4 over a huge
+    /// range re-renders all loaded terrain/objects several times per frame;
+    /// few short cascades keep the cost bounded.
     pub cascades: usize,
     /// Maximum shadow distance in world units, **PBR mode only** (~120
     /// covers the immediate combat area). Beware: the shadow map is spread
@@ -515,44 +539,39 @@ impl Default for ShadowSettings {
     }
 }
 
-/// Terrain lighting options (`terrain_splat.wgsl`; see
-/// `docs/rendering-mobile-shader-comparison.md` gaps #5/#6). Both values
-/// are also live-togglable in the render-debug panel for the A/B playtest.
+/// Terrain lighting options (`terrain_splat.wgsl`). The lighting *model*
+/// (dynamic PBR vs. baked) follows [`RenderMode`] — see
+/// [`TerrainGraphicsSettings::to_render_params`] — not a field here; the
+/// third A/B option (`flat_baked`, no N·L but keeps the time-of-day tint) is
+/// reachable only as a live override in the render-debug panel
+/// (`docs/rendering-mobile-shader-comparison.md` gaps #5/#6), since it isn't
+/// one of the two shipped modes.
 #[derive(Deserialize, Debug, Clone, Default)]
 #[serde(default)]
 pub struct TerrainGraphicsSettings {
-    /// `dynamic` = current full PBR sun + ambient over the baked lightmap;
-    /// `flat_baked` = no N·L/specular but the time-of-day ambient tint
-    /// stays; `baked` = albedo × lightmap, full stop (the mobile port's —
-    /// and probably the original's — fully baked ground, which also loses
-    /// day/night response). Default stays `dynamic` until the A/B playtest
-    /// picks a winner.
-    pub lighting: TerrainLightingConfig,
     /// Mirror the baked lightmap's V axis — the pending `.t` row-order
     /// calibration (`docs/formats/mapt-jmxvmapt.md`); flip if baked shadows
     /// come out mirrored along Z.
     pub lightmap_flip_v: bool,
 }
 
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum TerrainLightingConfig {
-    #[default]
-    Dynamic,
-    FlatBaked,
-    Baked,
-}
-
 impl TerrainGraphicsSettings {
-    pub fn to_render_params(&self) -> crate::assets::m::block_splat_material::TerrainRenderParams {
+    /// `render_mode` comes from the sibling [`GraphicsSettings::render_mode`]
+    /// field, not `self` — it decides the terrain shader's lighting model:
+    /// `Vanilla` → fully baked (`albedo × lightmap`), `Pbr` → dynamic PBR sun
+    /// + ambient over the baked lightmap.
+    pub fn to_render_params(
+        &self,
+        render_mode: RenderMode,
+    ) -> crate::assets::m::block_splat_material::TerrainRenderParams {
         use crate::assets::m::block_splat_material::{TerrainLightingMode, TerrainRenderParams};
         TerrainRenderParams {
             lightmap_flip_v: self.lightmap_flip_v,
-            lighting_mode: match self.lighting {
-                TerrainLightingConfig::Dynamic => TerrainLightingMode::Dynamic,
-                TerrainLightingConfig::FlatBaked => TerrainLightingMode::FlatBaked,
-                TerrainLightingConfig::Baked => TerrainLightingMode::Baked,
+            lighting_mode: match render_mode {
+                RenderMode::Vanilla => TerrainLightingMode::Baked,
+                RenderMode::Pbr => TerrainLightingMode::Dynamic,
             },
+            lightmap_enabled: render_mode == RenderMode::Vanilla,
             // splat 24/32 repeat factors are a calibration in progress
             // (render-debug sliders), not a config concern
             ..TerrainRenderParams::default()

@@ -9,15 +9,15 @@
 // while its `JMXVMAPM` asset is still resident. Profile switches (region borders, manual
 // override) are smoothed by lerping the *sampled output* toward its target instead of
 // tracking from/to profiles. SRO dims the world via these colors, so mostly colors are
-// written here — the sun's illuminance scalar stays owned by `dev/lighting.rs`, and
+// written here — the sun's illuminance scalar stays owned by `apply_render_mode`, and
 // `DistanceFog` presence (insert/remove) stays owned by `dev/render_debug.rs`. The graphs
-// drive both lighting models: `EnvironmentSettings.enabled` (hotkey N) switches the full
-// vanilla/PBR render mode — the ambient-brightness model (SRO-faithful
-// `ambient_brightness` vs the PBR baseline of `setup_lighting`), the baked terrain
-// lightmap (`apply_render_mode`), and who casts into the shadow maps (vanilla = only the
-// player, like the original; PBR = everything — `apply_vanilla_shadow_casters`) — while
-// the graph colors/fog/sky apply identically in both modes. The hardcoded defaults
-// survive only as the pre-load fallback (no envi asset / no active profile yet).
+// drive both lighting models: `EnvironmentSettings.mode` (`RenderMode`, hotkey N) switches
+// the full vanilla/PBR render mode — the ambient-brightness model (SRO-faithful
+// `ambient_brightness` vs the PBR baseline `pbr_ambient_brightness`), the baked terrain
+// lightmap, and the Sun's directional light + shadow maps themselves (vanilla disables
+// both outright; PBR lights and shadows everything — see `apply_render_mode`) — while the
+// graph colors/fog/sky apply identically in both modes. The hardcoded defaults survive
+// only as the pre-load fallback (no envi asset / no active profile yet).
 
 use std::collections::HashMap;
 use std::f32::consts::{PI, TAU};
@@ -31,6 +31,7 @@ use crate::assets::ifo::environment::{ColorGraph, EnvironmentProfile, FloatGraph
 use crate::assets::ifo::IFOAsset;
 use crate::assets::m::block_splat_material::TerrainAmbientRatio;
 use crate::assets::m::JMXVMAPM;
+use crate::plugins::config::graphics::RenderMode;
 use crate::plugins::config::ClientConfig;
 use crate::plugins::environment::celestial::{CelestialMaterials, CelestialPlugin};
 use crate::plugins::map::assets::MapsAssets;
@@ -53,6 +54,15 @@ pub mod reflections;
 /// Marks the world's single directional light (spawned in `map::setup_lighting`).
 #[derive(Component)]
 pub struct Sun;
+
+/// Present on the Sun entity only while `EnvironmentSettings.mode` is `RenderMode::Pbr`
+/// (kept in sync by `apply_render_mode`). Lets other dev-only systems that still want to
+/// write to the Sun's `DirectionalLight` — e.g. the render-debug panel's `enable_shadows`
+/// toggle — filter themselves out in vanilla mode via the query itself instead of taking
+/// an extra `Res<EnvironmentSettings>` system parameter (this crate has systems already at
+/// Bevy's per-system parameter ceiling).
+#[derive(Component)]
+pub struct PbrModeActive;
 
 #[derive(Resource, Reflect, InspectorOptions)]
 #[reflect(Resource, InspectorOptions)]
@@ -79,14 +89,16 @@ impl Default for TimeOfDay {
 #[derive(Resource, Reflect, InspectorOptions)]
 #[reflect(Resource, InspectorOptions)]
 pub struct EnvironmentSettings {
-    /// Vanilla/PBR render-mode switch (hotkey N): on = SRO-faithful — the
-    /// `ambient_brightness` model, the baked terrain lightmap, and only the
-    /// player casting a dynamic shadow (like the original client); off = PBR —
-    /// the ambient baseline from `setup_lighting`, lightmap off, everything
-    /// casting into the config-scoped cascaded shadows (`apply_render_mode` +
-    /// `apply_vanilla_shadow_casters`). The environment graphs (colors, fog,
-    /// sky, sun animation) apply in both modes.
-    pub enabled: bool,
+    /// Vanilla/PBR render-mode switch. Seeded from `graphics.render_mode` at
+    /// startup (`seed_environment_settings_from_config`); hotkey N flips it
+    /// live for the session without touching config. `Vanilla` = SRO-faithful
+    /// — the `ambient_brightness` model, the baked terrain lightmap, the
+    /// Sun's directional light and shadow maps both off. `Pbr` = the
+    /// `pbr_ambient_brightness` baseline, lightmap off, the Sun lit and
+    /// casting cascaded shadows from everything (`apply_render_mode`). The
+    /// environment graphs (colors, fog, sky, sun animation) apply in both
+    /// modes.
+    pub mode: RenderMode,
     /// -1 = follow the camera's region; otherwise forces this profile id.
     pub profile_override: i32,
     /// Rotate the sun's pitch with the time of day. While on, this overwrites the
@@ -118,20 +130,12 @@ pub struct EnvironmentSettings {
     /// sun-averted faces.
     #[inspector(min = 0.0, max = 20_000.0)]
     pub pbr_ambient_brightness: f32,
-    /// Extra darkening of the ground under the player's shadow in vanilla mode
-    /// (0 = off, 1 = black). The cascaded maps alone read too faint there: SRO's
-    /// ambient is comparable to the sun, and a shadow only removes the sun's
-    /// direct term — this multiplies the *lit* result down instead, standing in
-    /// for the original client's dark projected player shadow. PBR mode ignores
-    /// it (physically-based shadowing only).
-    #[inspector(min = 0.0, max = 1.0)]
-    pub vanilla_shadow_strength: f32,
 }
 
 impl Default for EnvironmentSettings {
     fn default() -> Self {
         Self {
-            enabled: true,
+            mode: RenderMode::Vanilla,
             profile_override: -1,
             animate_sun_direction: true,
             ambient_brightness: 3_000.0,
@@ -139,7 +143,6 @@ impl Default for EnvironmentSettings {
             fog_distance_scale: 1.5,
             transition_seconds: 1.0,
             pbr_ambient_brightness: 100.0,
-            vanilla_shadow_strength: 0.4,
         }
     }
 }
@@ -502,6 +505,7 @@ impl Plugin for EnvironmentPlugin {
             .init_resource::<EnvSmoothing>()
             .init_resource::<AppliedEnvColors>()
             .add_plugins(CelestialPlugin)
+            .add_systems(Startup, seed_environment_settings_from_config)
             .add_systems(
                 Update,
                 (
@@ -528,21 +532,6 @@ impl Plugin for EnvironmentPlugin {
                 apply_render_mode
                     .run_if(in_state(GameState::Game))
                     .run_if(resource_changed::<EnvironmentSettings>),
-            )
-            // Every frame (cheap: one distance compare at steady state) — the
-            // vanilla cascade range follows the player's view depth so free
-            // cameras keep the player shadow (see the system doc).
-            .add_systems(
-                Update,
-                scale_vanilla_cascades
-                    .after(apply_render_mode)
-                    .run_if(in_state(GameState::Game)),
-            )
-            // PostUpdate, every frame: fresh spawns must be caught after
-            // Update's spawn commands applied (see the system doc).
-            .add_systems(
-                PostUpdate,
-                apply_vanilla_shadow_casters.run_if(in_state(GameState::Game)),
             );
 
         // Dev-tools gate (config.yaml `dev_tools`, inserted in main() before
@@ -590,7 +579,10 @@ fn environment_hotkeys(
     mut tod: ResMut<TimeOfDay>,
 ) {
     if keys.just_pressed(KeyCode::KeyN) {
-        settings.enabled = !settings.enabled;
+        settings.mode = match settings.mode {
+            RenderMode::Vanilla => RenderMode::Pbr,
+            RenderMode::Pbr => RenderMode::Vanilla,
+        };
     }
     // Shift+M (bare M opens the world map; P steps the env-reflection
     // intensity in dev/lighting.rs)
@@ -608,175 +600,82 @@ fn environment_hotkeys(
     }
 }
 
-/// Wires the vanilla/PBR switch (`EnvironmentSettings.enabled`, hotkey N) to the baked
-/// terrain lightmap, the player-shadow boost, and the Sun's cascade scoping: vanilla =
-/// lightmap multiplied into the ground albedo + `vanilla_shadow_strength` darkening
-/// under the player's shadow + tight player-scoped cascades (crisp character shadow);
-/// PBR = lightmap off, boost off, config-scoped cascades (everything casts and the
-/// cascaded shadows shade the ground physically). Deliberately separate from
-/// `apply_environment`, which early-returns until environment.ifo resolves and is
-/// dungeon-gated. The lightmap rides the shared `TerrainRenderParams` buffer, never the
-/// splat material assets (bind-group leak, see block_splat_material.rs). Who *casts*
-/// into the shadow maps is the mode's other half — see `apply_vanilla_shadow_casters`.
-/// Note: shadows only land on terrain in `lighting_mode: dynamic` — the other modes
-/// bypass `apply_pbr_lighting`.
+/// Copies `graphics.render_mode` into the runtime resource at boot, so the persisted
+/// config decides the starting render mode instead of `EnvironmentSettings::default()`
+/// (which only matters for the brief window before this runs). Mirrors
+/// `dev::render_debug::seed_terrain_settings_from_config`'s config-is-the-baseline
+/// pattern. Reads `Res<ClientConfig>` directly rather than ordering against
+/// `map::setup_lighting` (also Startup, spawns the Sun already matching
+/// `config.graphics.render_mode`) — both converge on the same config, so there is
+/// nothing to race.
+fn seed_environment_settings_from_config(
+    config: Res<ClientConfig>,
+    mut settings: ResMut<EnvironmentSettings>,
+) {
+    settings.mode = config.graphics.render_mode;
+}
+
+/// Wires the vanilla/PBR switch (`EnvironmentSettings.mode`, hotkey N) directly to the
+/// Sun and the baked terrain lightmap. Vanilla: lightmap on, the Sun's directional light
+/// and shadow maps both off (`DirectionalLight::illuminance = 0`,
+/// `shadow_maps_enabled = false`) — ambient-only, SRO-faithful lighting, no shadow-cascade
+/// pass at all. PBR: lightmap off, the Sun lit at `AMBIENT_DAYLIGHT` and casting into the
+/// config-scoped cascaded shadows (`graphics.shadows`) from every caster. The Sun's
+/// `CascadeShadowConfig` itself is built once at spawn (`map::setup_lighting`) and never
+/// touched here — vanilla no longer uses cascades at all, so there is nothing to rescope
+/// on a flip. Deliberately separate from `apply_environment`, which early-returns until
+/// environment.ifo resolves and is dungeon-gated. The lightmap rides the shared
+/// `TerrainRenderParams` buffer, never the splat material assets (bind-group leak, see
+/// block_splat_material.rs). Note: shadows only land on terrain in `lighting_mode:
+/// dynamic` — the other modes bypass `apply_pbr_lighting`.
 fn apply_render_mode(
     settings: Res<EnvironmentSettings>,
     config: Res<ClientConfig>,
     terrain_params: Option<ResMut<crate::assets::m::block_splat_material::TerrainRenderParams>>,
-    sun_query: Query<Entity, With<Sun>>,
+    mut sun_query: Query<(Entity, &mut DirectionalLight), With<Sun>>,
     mut commands: Commands,
-    mut last_enabled: Local<Option<bool>>,
+    mut last_mode: Local<Option<RenderMode>>,
 ) {
+    let lightmap_enabled = settings.mode == RenderMode::Vanilla;
     if let Some(mut params) = terrain_params {
-        let shadow_strength = if settings.enabled {
-            settings.vanilla_shadow_strength
-        } else {
-            0.0
-        };
         // Guarded write: don't dirty the extract/write_terrain_params chain when
         // another EnvironmentSettings field changed.
-        if params.lightmap_enabled != settings.enabled || params.shadow_strength != shadow_strength
-        {
-            params.lightmap_enabled = settings.enabled;
-            params.shadow_strength = shadow_strength;
+        if params.lightmap_enabled != lightmap_enabled {
+            params.lightmap_enabled = lightmap_enabled;
         }
     }
-    // Cascade re-scope + console confirmation only on an actual mode flip
-    // (this system fires on ANY EnvironmentSettings change, e.g. slider drags).
-    // Only the PBR config is inserted here — the vanilla range is owned by
-    // `scale_vanilla_cascades`, which runs right after this system and writes
-    // the component directly; a deferred insert here would overwrite its
-    // same-frame write at the end of the flip frame.
-    if *last_enabled != Some(settings.enabled) {
-        *last_enabled = Some(settings.enabled);
-        if !settings.enabled {
-            for sun in &sun_query {
-                commands
-                    .entity(sun)
-                    .insert(crate::plugins::map::sun_cascade_config(
-                        false,
-                        &config.graphics.shadows,
-                    ));
+
+    // Sun + console confirmation only on an actual mode flip (this system fires on
+    // ANY EnvironmentSettings change, e.g. slider drags).
+    if *last_mode == Some(settings.mode) {
+        return;
+    }
+    *last_mode = Some(settings.mode);
+    for (sun, mut light) in &mut sun_query {
+        match settings.mode {
+            RenderMode::Vanilla => {
+                light.illuminance = 0.0;
+                light.shadow_maps_enabled = false;
+                commands.entity(sun).remove::<PbrModeActive>();
+            }
+            RenderMode::Pbr => {
+                light.illuminance = light_consts::lux::AMBIENT_DAYLIGHT;
+                light.shadow_maps_enabled = config.graphics.shadows.enabled;
+                commands.entity(sun).insert(PbrModeActive);
             }
         }
-        if settings.enabled {
-            info!(
-                "render mode: vanilla (lightmap on, player-only shadow casters, \
-                 shadow boost {}, ambient {})",
-                settings.vanilla_shadow_strength, settings.ambient_brightness
-            );
-        } else {
-            info!(
-                "render mode: PBR (lightmap off, all shadow casters, ambient {})",
-                settings.pbr_ambient_brightness
-            );
-        }
     }
-}
-
-/// Stretches the vanilla cascade range to keep the player's shadow alive under free
-/// cameras. Bevy scopes cascades to the VIEW frustum, so "player-scoped" bounds only
-/// work while the camera follows the player — a debug/fly camera watching from afar
-/// leaves the player beyond the last cascade and the shadow fades out (world-scene
-/// playtest). Every frame in vanilla mode, take the player's view depth from the
-/// farthest active camera and rebuild the Sun's `CascadeShadowConfig` to reach just
-/// past it — tight (crisp texels) when the camera is close, extended when it is not.
-/// The range is quantized to coarse steps so bounds don't jitter per frame, and the
-/// cascade count never changes (see `map::sun_cascade_config` — growing it panics in
-/// bevy_light). PBR mode is untouched: `apply_render_mode` re-inserts the config-scoped
-/// cascades on the mode flip.
-fn scale_vanilla_cascades(
-    settings: Res<EnvironmentSettings>,
-    config: Res<ClientConfig>,
-    players: Query<&GlobalTransform, With<crate::plugins::player::Player>>,
-    cameras: Query<(&GlobalTransform, &Camera, &bevy::camera::RenderTarget), With<Camera3d>>,
-    mut suns: Query<&mut bevy::light::CascadeShadowConfig, With<Sun>>,
-    mut applied_distance: Local<f32>,
-) {
-    if !settings.enabled {
-        // Forget the applied range so re-entering vanilla mode re-applies it
-        // (apply_render_mode resets the Sun to the baseline on the flip).
-        *applied_distance = 0.0;
-        return;
-    }
-    let Ok(player) = players.single() else {
-        return;
-    };
-    let mut view_depth: f32 = 0.0;
-    for (camera_transform, camera, target) in &cameras {
-        // Only the camera the user actually views through: the offscreen RTT
-        // rigs (portrait, paper doll) are active Camera3ds too and must not
-        // stretch the Sun's cascades; `switch_camera` keeps the window
-        // cameras (player/fly) mutually exclusive.
-        if !camera.is_active || !matches!(target, bevy::camera::RenderTarget::Window(_)) {
-            continue;
-        }
-        let to_player = player.translation() - camera_transform.translation();
-        view_depth = view_depth.max(to_player.dot(*camera_transform.forward()));
-    }
-    // Margin keeps the ground around the player covered; 200-unit steps keep the
-    // rebuilt bounds stable across frames (bevy rebuilds the actual cascades from
-    // this config every frame regardless).
-    let max_distance = ((view_depth * 1.2 + 200.0) / 200.0).ceil() * 200.0;
-    let max_distance =
-        max_distance.clamp(crate::plugins::map::VANILLA_SHADOW_BASE_DISTANCE, 20_000.0);
-    if *applied_distance == max_distance {
-        return;
-    }
-    *applied_distance = max_distance;
-    debug!("vanilla shadow range -> {max_distance} (player view depth {view_depth:.0})");
-    for mut cascade_config in &mut suns {
-        *cascade_config =
-            crate::plugins::map::vanilla_cascade_config(&config.graphics.shadows, max_distance);
-    }
-}
-
-/// Meshes whose shadow casting the vanilla mode suppressed. Distinct from meshes that
-/// are `NotShadowCaster` for reasons of their own (skybox, effects, item drops, foliage
-/// config…), so PBR mode restores exactly what vanilla removed and nothing else.
-#[derive(Component)]
-struct VanillaShadowSuppressed;
-
-/// The vanilla/PBR switch's shadow half: shadow maps stay enabled in both modes
-/// (`graphics.shadows.enabled` is the master gate), the modes differ in who casts.
-/// Vanilla = only the local player's meshes — the original client draws just a player
-/// shadow, with the baked terrain lightmap carrying every static shadow; PBR = every
-/// mesh casts. Runs every frame (PostUpdate, after the spawn commands of Update have
-/// applied, so streamed-in meshes never cast for a frame): in vanilla the un-suppressed
-/// query is only the player's meshes plus fresh spawns, in PBR the suppressed query is
-/// empty after the first sweep — both are cheap at steady state.
-fn apply_vanilla_shadow_casters(
-    settings: Res<EnvironmentSettings>,
-    unsuppressed: Query<
-        Entity,
-        (
-            With<bevy::mesh::Mesh3d>,
-            Without<bevy::light::NotShadowCaster>,
+    match settings.mode {
+        RenderMode::Vanilla => info!(
+            "render mode: vanilla (baked lightmap, ambient {} only, no directional \
+             light or shadows)",
+            settings.ambient_brightness
         ),
-    >,
-    suppressed: Query<Entity, With<VanillaShadowSuppressed>>,
-    parents: Query<&ChildOf>,
-    players: Query<(), With<crate::plugins::player::Player>>,
-    mut commands: Commands,
-) {
-    if settings.enabled {
-        for entity in &unsuppressed {
-            let is_player_mesh = std::iter::once(entity)
-                .chain(parents.iter_ancestors(entity))
-                .any(|ancestor| players.contains(ancestor));
-            if !is_player_mesh {
-                commands
-                    .entity(entity)
-                    .insert((bevy::light::NotShadowCaster, VanillaShadowSuppressed));
-            }
-        }
-    } else {
-        for entity in &suppressed {
-            commands
-                .entity(entity)
-                .remove::<(bevy::light::NotShadowCaster, VanillaShadowSuppressed)>();
-        }
+        RenderMode::Pbr => info!(
+            "render mode: PBR (directional light + cascaded shadows, lightmap off, \
+             ambient {})",
+            settings.pbr_ambient_brightness
+        ),
     }
 }
 
@@ -914,7 +813,7 @@ fn apply_environment(
     let srgb = |v: Vec3| Color::srgb(v.x, v.y, v.z);
 
     ambient.color = srgb(sample.ambient_color);
-    ambient.brightness = if settings.enabled {
+    ambient.brightness = if settings.mode == RenderMode::Vanilla {
         settings.ambient_brightness
     } else {
         settings.pbr_ambient_brightness
