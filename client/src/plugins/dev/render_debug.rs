@@ -91,11 +91,14 @@ fn seed_terrain_settings_from_config(
     config: Res<crate::plugins::config::ClientConfig>,
     mut settings: ResMut<RenderDebugSettings>,
 ) {
-    use crate::plugins::config::graphics::TerrainLightingConfig;
-    settings.terrain_lighting_mode = match config.graphics.terrain.lighting {
-        TerrainLightingConfig::Dynamic => 0,
-        TerrainLightingConfig::FlatBaked => 1,
-        TerrainLightingConfig::Baked => 2,
+    use crate::plugins::config::graphics::RenderMode;
+    // The terrain lighting model no longer has its own persisted config
+    // field — it follows `graphics.render_mode` (Vanilla -> Baked, Pbr ->
+    // Dynamic), like every other mode-driven terrain param. `FlatBaked` (1)
+    // is reachable only by cycling this panel live, never as a seeded value.
+    settings.terrain_lighting_mode = match config.graphics.render_mode {
+        RenderMode::Pbr => 0,
+        RenderMode::Vanilla => 2,
     };
     settings.terrain_lightmap_flip_v = config.graphics.terrain.lightmap_flip_v;
     settings.enable_shadows = config.graphics.shadows.enabled;
@@ -204,9 +207,10 @@ pub struct RenderDebugSettings {
     /// Cascaded sun shadows, live toggle. Seeded from
     /// `graphics.shadows.enabled` (the master switch, which also sets the
     /// cascade count/distance at sun spawn); flip here for the perf A/B.
-    /// Orthogonal to the vanilla/PBR switch (hotkey N), which decides who
-    /// *casts* into the maps (`environment::apply_vanilla_shadow_casters`),
-    /// not whether the maps render.
+    /// **PBR mode only**: the vanilla/PBR switch (hotkey N) disables the
+    /// Sun's shadow maps outright in vanilla mode
+    /// (`environment::apply_render_mode`), so this toggle has no effect
+    /// there — it only matters once PBR mode's shadows are already on.
     pub enable_shadows: bool,
     pub enable_fog: bool,
     /// Bloom post-process on the main-view cameras. Only has an effect when
@@ -356,12 +360,24 @@ fn on_settings_changed(
         ),
     >,
     mut effect_params: EffectDebugParams,
-    // Only the Sun follows the shadow toggle. The portrait/paper-doll headlights
-    // carry Bevy's default CascadeShadowConfig (4 cascades) vs the Sun's
-    // mode-dependent config (`map::sun_cascade_config`); if they also became
-    // shadow casters, `check_dir_light_mesh_visibility` would index its shared
-    // per-thread cascade queue out of bounds (issue #207).
-    mut directional_light: Query<&mut DirectionalLight, With<crate::plugins::environment::Sun>>,
+    // Only the Sun follows the shadow toggle, and only in PBR mode: vanilla
+    // mode disables the Sun's shadow maps outright
+    // (`environment::apply_render_mode`), so filtering on `PbrModeActive`
+    // (which that system maintains) makes this toggle a no-op there instead
+    // of fighting it — without a 17th system parameter for
+    // `Res<EnvironmentSettings>` (this system is already at Bevy's per-system
+    // parameter ceiling). The portrait/paper-doll headlights carry Bevy's
+    // default CascadeShadowConfig (4 cascades) vs. the Sun's config-derived
+    // one (`map::setup_lighting`); if they also became shadow casters,
+    // `check_dir_light_mesh_visibility` would index its shared per-thread
+    // cascade queue out of bounds (issue #207).
+    mut directional_light: Query<
+        &mut DirectionalLight,
+        (
+            With<crate::plugins::environment::Sun>,
+            With<crate::plugins::environment::PbrModeActive>,
+        ),
+    >,
     all_entities: Query<Entity, Without<IsResource>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut terrain_materials: ResMut<Assets<TerrainBlockSplatMaterial>>,

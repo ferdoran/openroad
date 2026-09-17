@@ -176,7 +176,17 @@ pub const SETTINGS_AUDIT: &[SettingsGroup] = &[
         note: "terrain params via apply_terrain_render_params, bloom via \
                options_video::apply_bloom_option, rim mode via \
                apply_selection_colors, foliage via \
-               map::foliage::apply_foliage_settings (#646). Brightness and the \
+               map::foliage::apply_foliage_settings (#646). render_mode is \
+               read at Sun spawn (map::setup_lighting) for the boot state, \
+               and apply_terrain_render_params re-derives the terrain \
+               lightmap/lighting mode from it on every later ClientConfig \
+               change too, same as the rest of this group. The Sun's own \
+               DirectionalLight (illuminance, shadow_maps_enabled) is the \
+               exception: it only follows render_mode once, at boot, and \
+               thereafter changes solely via the dev-tools-gated hotkey N \
+               (environment::seed_environment_settings_from_config, \
+               environment::apply_render_mode) — a later config-only edit to \
+               render_mode does not move the live Sun. Brightness and the \
                unbacked quality rows have no feature behind them yet and say \
                so in the pane",
     },
