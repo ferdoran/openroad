@@ -889,6 +889,7 @@ fn drive_character_animation(
     ban_assets: &Assets<JMXVBAN>,
     animation_clips: &mut Assets<AnimationClip>,
     animation_graphs: &mut Assets<AnimationGraph>,
+    budget: &mut i32,
 ) {
     for child in children.iter() {
         let Ok((
@@ -1020,6 +1021,16 @@ fn drive_character_animation(
         {
             continue;
         }
+
+        // Budgeted: this entity's clips are all decoded and ready to build,
+        // but building spends real CPU on decoding into an AnimationClip —
+        // see ANIMATION_BUILDS_PER_FRAME. A skipped entity costs nothing to
+        // retry: it simply keeps `MovementAnims` absent, which is exactly
+        // the condition that routed it into this branch.
+        if *budget <= 0 {
+            continue;
+        }
+        *budget -= 1;
 
         let Some(stand_idx) = resource.find_animation(group, ANIM_TYPE_STAND) else {
             continue;
@@ -1195,12 +1206,34 @@ fn drive_character_animation(
     }
 }
 
+/// First-sight AnimationGraph builds budgeted per frame, across every
+/// remote entity `update_character_animation` walks this call. A single
+/// build decodes every stand/run/walk/attack/damage/die/pickup/stun `.ban`
+/// clip a group resolves (`drive_character_animation`'s first-sight
+/// branch) — real CPU decode work, not just a spawn. Many `RemoteEntity`s
+/// can lose their `MovementAnims` at once (a region crossing into a
+/// crowded town/battlefield, or a batch of nearby-entity spawns landing
+/// together), which would otherwise build all of them in the same frame.
+/// Same idiom as the terrain budgets (`OBJECT_SPAWNS_PER_FRAME`,
+/// `GROUP_BUILDS_PER_FRAME`) that fixed the measured 208ms region-crossing
+/// hitch (`docs/perf-remote.md`). Unlike those, this value is **not**
+/// backed by a live capture yet — it's a conservative starting estimate
+/// (a build is multi-clip-decode work, closer in cost to
+/// `GROUP_BUILDS_PER_FRAME`'s per-unit cost than to the plain-spawn
+/// `OBJECT_SPAWNS_PER_FRAME`) and should be retuned once this is profiled
+/// live.
+const ANIMATION_BUILDS_PER_FRAME: i32 = 4;
+
 /// Drives stand/run animation for the local player and every remote entity from
 /// the same code path. "Moving" is [`PlayerCommands::is_moving`] for the player
 /// and a live [`RemoteMovement`] target for remotes; both share one
 /// `wrapper_query` so the graph build/swap logic lives in one place
 /// ([`drive_character_animation`]). Items carry no [`RemoteMovement`], so the
 /// remote query skips them.
+///
+/// The local player's own build is never budgeted — it's a single entity
+/// and should never lag behind its own input. `ANIMATION_BUILDS_PER_FRAME`
+/// only caps bursts across the remote entities below.
 #[allow(clippy::too_many_arguments)]
 fn update_character_animation(
     mut commands: Commands,
@@ -1235,6 +1268,7 @@ fn update_character_animation(
     mut animation_graphs: ResMut<Assets<AnimationGraph>>,
 ) {
     if let Ok((children, group, mounted, stunned, frozen)) = player_query.single() {
+        let mut player_budget = i32::MAX;
         drive_character_animation(
             &mut commands,
             children,
@@ -1256,9 +1290,11 @@ fn update_character_animation(
             &ban_assets,
             &mut animation_clips,
             &mut animation_graphs,
+            &mut player_budget,
         );
     }
 
+    let mut budget = ANIMATION_BUILDS_PER_FRAME;
     for (children, group, movement, mounted, stunned, frozen) in remote_query.iter() {
         drive_character_animation(
             &mut commands,
@@ -1274,6 +1310,7 @@ fn update_character_animation(
             &ban_assets,
             &mut animation_clips,
             &mut animation_graphs,
+            &mut budget,
         );
     }
 }
