@@ -404,7 +404,13 @@ pub fn on_char_selection_action_response(
                     char.mp,
                 );
                 let ref_char_id = char.ref_obj_id as i32;
-                let char_data = char_data.get(&ref_char_id).unwrap();
+                let Some(char_data) = char_data.get(&ref_char_id) else {
+                    warn!(
+                        "lobby char '{}': no characterdata row for ref {ref_char_id} (missing/skipped shard?); not rendering this character",
+                        char.name
+                    );
+                    continue;
+                };
                 let offset = (dir / (characters.count as f32 + 1.0)) * (i as f32 + 1.0);
                 let path = char_data.resource_path();
                 // Characters are mirrored on X (scale.x = -1) like every other

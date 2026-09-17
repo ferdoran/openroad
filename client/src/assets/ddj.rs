@@ -244,6 +244,43 @@ pub fn dds_buffer_to_image(dds_bytes: &[u8]) -> Option<Image> {
     .to_image(true)
 }
 
+/// A minimal, deliberately synthetic 1x1 magenta `.ddj` file. Substituted by
+/// `plugins::assets::fallback_reader::FallbackAssetReader` for a `.ddj` path
+/// the archive doesn't have, so a missing texture becomes a visibly-a-
+/// placeholder image instead of a `LoadState::Failed` that hangs
+/// `bevy_asset_loader`'s `AssetCollection` gate forever (see ADR/PR notes on
+/// the stuck-loading-screen bug). Magenta, not Bevy's own default white
+/// handle, so a substituted asset is distinguishable on screen from an
+/// unset `Handle<Image>`.
+///
+/// Built from the same container layout this module already documents
+/// (`DDJ_SIGNATURE` + `DDJ_HEADER_LEN`) rather than a byte literal, so it
+/// stays correct if that layout ever changes. Every step here is checked
+/// against a fixed 1x1 `X8R8G8B8` shape, so the `expect`s cannot fail.
+pub fn placeholder_ddj_bytes() -> Vec<u8> {
+    let mut dds = Dds::new_d3d(NewD3dParams {
+        height: 1,
+        width: 1,
+        depth: None,
+        format: D3DFormat::X8R8G8B8,
+        mipmap_levels: Some(1),
+        caps2: None,
+    })
+    .expect("a 1x1 X8R8G8B8 DDS header is always constructible");
+    // X8R8G8B8, little-endian: magenta (r=255, g=0, b=255).
+    dds.data = vec![0xFF, 0x00, 0xFF, 0x00];
+    let mut dds_bytes = Vec::new();
+    dds.write(&mut dds_bytes)
+        .expect("writing an in-memory DDS buffer cannot fail");
+
+    let mut bytes = Vec::with_capacity(DDJ_HEADER_LEN + dds_bytes.len());
+    bytes.extend_from_slice(DDJ_SIGNATURE.as_bytes());
+    bytes.extend_from_slice(&(dds_bytes.len() as i32).to_le_bytes());
+    bytes.extend_from_slice(&(D3dResourceType::Texture as i32).to_le_bytes());
+    bytes.extend_from_slice(&dds_bytes);
+    bytes
+}
+
 /// CPU decode of the uncompressed D3D formats SRO ships (A1R5G5B5, R5G6B5,
 /// X8R8G8B8, A8R8G8B8) to `(width, height, RGBA8 mip 0)`. Returns `None`
 /// for compressed (DXTn) and unknown formats — callers decode those with a
@@ -1154,6 +1191,21 @@ mod tests {
             JMXVDDJ::try_from(&mut raw),
             Err(DDJLoaderErrors::Truncated(9))
         ));
+    }
+
+    /// `FallbackAssetReader` substitutes these bytes for a missing `.ddj`
+    /// file; they must round-trip through the same container parse and
+    /// pixel decode a real file would, all the way to a valid 1x1 `Image`,
+    /// or the "fix" would just move the stuck-loading-screen bug one layer
+    /// down instead of closing it.
+    #[test]
+    fn placeholder_ddj_bytes_decode_to_a_1x1_magenta_image() {
+        let bytes = placeholder_ddj_bytes();
+        let ddj = JMXVDDJ::try_from(&mut Bytes::from(bytes)).expect("must parse as a DDJ");
+        let image = ddj.to_image(true).expect("must decode to an image");
+        assert_eq!(image.texture_descriptor.size.width, 1);
+        assert_eq!(image.texture_descriptor.size.height, 1);
+        assert_eq!(image.data.as_deref(), Some([255, 0, 255, 255].as_slice()));
     }
 
     /// 4-bit channels expand by nibble replication, so 0xF -> 255 exactly and

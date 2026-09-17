@@ -1,5 +1,6 @@
 use bevy::asset::io::Reader;
 use bevy::asset::{Asset, AssetLoader, LoadContext};
+use bevy::log::warn;
 use bevy::prelude::TypePath;
 use std::collections::HashMap;
 use thiserror::Error;
@@ -189,18 +190,26 @@ impl AssetLoader for TextdataLoader {
 
                 let mut data = HashMap::new();
                 for file in files {
-                    let char_data = load_context
+                    let loaded = match load_context
                         .load_builder()
                         .load_untyped_value(format!(
                             "media://server_dep/silkroad/textdata/{}",
                             file
                         ))
                         .await
-                        .unwrap();
-                    let char_data = char_data.take::<Textdata>().unwrap();
-                    if let Textdata::CharacterData(char_data) = char_data {
-                        data.extend(char_data.0);
-                    }
+                    {
+                        Ok(loaded) => loaded,
+                        Err(e) => {
+                            warn!("characterdata: shard {file} missing or unreadable ({e}); skipping — entries from this file will be absent");
+                            continue;
+                        }
+                    };
+                    let Some(Textdata::CharacterData(char_data)) = loaded.take::<Textdata>()
+                    else {
+                        warn!("characterdata: shard {file} did not decode as character data; skipping");
+                        continue;
+                    };
+                    data.extend(char_data.0);
                 }
                 Ok(Textdata::CharacterData(CharacterData(data)))
             } else {
@@ -307,15 +316,22 @@ impl AssetLoader for TextdataLoader {
 
             let mut data = HashMap::new();
             for file in files {
-                let names = load_context
+                let loaded = match load_context
                     .load_builder()
                     .load_untyped_value(format!("media://server_dep/silkroad/textdata/{}", file))
                     .await
-                    .unwrap();
-                let names = names.take::<Textdata>().unwrap();
-                if let Textdata::Names(names) = names {
-                    data.extend(names.0);
-                }
+                {
+                    Ok(loaded) => loaded,
+                    Err(e) => {
+                        warn!("textdataname: shard {file} missing or unreadable ({e}); skipping — entries from this file will be absent");
+                        continue;
+                    }
+                };
+                let Some(Textdata::Names(names)) = loaded.take::<Textdata>() else {
+                    warn!("textdataname: shard {file} did not decode as a name table; skipping");
+                    continue;
+                };
+                data.extend(names.0);
             }
             Ok(Textdata::Names(TextdataNames(data)))
         } else if file_stem.starts_with("textdata_") {
@@ -331,18 +347,25 @@ impl AssetLoader for TextdataLoader {
 
                 let mut data = HashMap::new();
                 for file in files {
-                    let skill_data = load_context
+                    let loaded = match load_context
                         .load_builder()
                         .load_untyped_value(format!(
                             "media://server_dep/silkroad/textdata/{}",
                             file
                         ))
                         .await
-                        .unwrap();
-                    let skill_data = skill_data.take::<Textdata>().unwrap();
-                    if let Textdata::SkillData(skill_data) = skill_data {
-                        data.extend(skill_data.0);
-                    }
+                    {
+                        Ok(loaded) => loaded,
+                        Err(e) => {
+                            warn!("skilldata: shard {file} missing or unreadable ({e}); skipping — entries from this file will be absent");
+                            continue;
+                        }
+                    };
+                    let Some(Textdata::SkillData(skill_data)) = loaded.take::<Textdata>() else {
+                        warn!("skilldata: shard {file} did not decode as skill data; skipping");
+                        continue;
+                    };
+                    data.extend(skill_data.0);
                 }
                 Ok(Textdata::SkillData(SkillData(data)))
             } else {
@@ -416,18 +439,25 @@ impl AssetLoader for TextdataLoader {
 
                 let mut data = HashMap::new();
                 for file in files {
-                    let item_data = load_context
+                    let loaded = match load_context
                         .load_builder()
                         .load_untyped_value(format!(
                             "media://server_dep/silkroad/textdata/{}",
                             file
                         ))
                         .await
-                        .unwrap();
-                    let item_data = item_data.take::<Textdata>().unwrap();
-                    if let Textdata::ItemData(item_data) = item_data {
-                        data.extend(item_data.0);
-                    }
+                    {
+                        Ok(loaded) => loaded,
+                        Err(e) => {
+                            warn!("itemdata: shard {file} missing or unreadable ({e}); skipping — entries from this file will be absent");
+                            continue;
+                        }
+                    };
+                    let Some(Textdata::ItemData(item_data)) = loaded.take::<Textdata>() else {
+                        warn!("itemdata: shard {file} did not decode as item data; skipping");
+                        continue;
+                    };
+                    data.extend(item_data.0);
                 }
                 Ok(Textdata::ItemData(ItemData(data)))
             } else {
