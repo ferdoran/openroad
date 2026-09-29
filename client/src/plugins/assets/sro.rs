@@ -42,42 +42,29 @@ impl Plugin for SroAssetPlugin {
         // runs before the window exists, so the message is all the user gets.
         let key = Pk2Key::resolve().unwrap_or_else(|err| panic!("{err}"));
 
-        let media_archive = Archive::open_or_panic(media_path, &key);
-        app.insert_resource(MediaArchive(media_archive.clone()));
-        // Wrapped in `FallbackAssetReader` so one missing `.ddj`/`.wav` file
-        // substitutes a warned-about placeholder instead of leaving its
-        // `LoadState` `Failed`, which would otherwise hang
-        // `bevy_asset_loader`'s `AssetCollection` gate — and therefore the
-        // loading screen — forever (see `fallback_reader` module docs).
-        let media_reader = Box::new(FallbackAssetReader {
-            inner: media_archive,
-        });
-        let map_reader = Box::new(FallbackAssetReader {
-            inner: Archive::open_or_panic(map_path, &key),
-        });
-        let music_reader = Box::new(FallbackAssetReader {
-            inner: Archive::open_or_panic(music_path, &key),
-        });
-        let data_reader = Box::new(FallbackAssetReader {
-            inner: Archive::open_or_panic(data_path, &key),
-        });
-        let particles_reader = Box::new(FallbackAssetReader {
-            inner: Archive::open_or_panic(particles_path, &key),
-        });
+        // Two independent failure classes, handled at their own level. A
+        // missing *archive* is a data condition, not a bug: report which one
+        // and carry on -- consumers already tolerate an absent source
+        // (`Option<Res<MediaArchive>>`, asset loads that fail by name). A
+        // missing *file* inside an archive that did open is handled one layer
+        // down by `FallbackAssetReader`, which substitutes a warned-about
+        // placeholder so a `Failed` load cannot hang `bevy_asset_loader`'s
+        // `AssetCollection` gate (see `fallback_reader` module docs).
+        let media_archive = Archive::open_or_report(media_path, &key);
+        if let Some(media_archive) = media_archive.clone() {
+            app.insert_resource(MediaArchive(media_archive));
+        }
 
-        app.register_asset_source(
-            "media",
-            AssetSourceBuilder::new(move || media_reader.clone()),
-        );
-        app.register_asset_source("map", AssetSourceBuilder::new(move || map_reader.clone()));
-        app.register_asset_source("data", AssetSourceBuilder::new(move || data_reader.clone()));
-        app.register_asset_source(
-            "music",
-            AssetSourceBuilder::new(move || music_reader.clone()),
-        );
-        app.register_asset_source(
-            "particles",
-            AssetSourceBuilder::new(move || particles_reader.clone()),
-        );
+        for (name, archive) in [
+            ("media", media_archive),
+            ("map", Archive::open_or_report(map_path, &key)),
+            ("music", Archive::open_or_report(music_path, &key)),
+            ("data", Archive::open_or_report(data_path, &key)),
+            ("particles", Archive::open_or_report(particles_path, &key)),
+        ] {
+            let Some(archive) = archive else { continue };
+            let reader = Box::new(FallbackAssetReader { inner: archive });
+            app.register_asset_source(name, AssetSourceBuilder::new(move || reader.clone()));
+        }
     }
 }
