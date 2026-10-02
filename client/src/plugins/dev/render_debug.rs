@@ -93,8 +93,10 @@ fn seed_terrain_settings_from_config(
     use crate::plugins::config::graphics::RenderMode;
     // The terrain lighting model no longer has its own persisted config
     // field — it follows `graphics.render_mode` (Vanilla -> Baked, Pbr ->
-    // Dynamic), like every other mode-driven terrain param. `FlatBaked` (1)
-    // is reachable only by cycling this panel live, never as a seeded value.
+    // Dynamic), like every other mode-driven terrain param. These two are now
+    // the only modes: the third one, `FlatBaked` (1), was removed in
+    // ferdoran/openroad#5 — it was reachable only by cycling this panel, and
+    // in `render_mode: pbr` it rendered the ground black.
     settings.terrain_lighting_mode = match config.graphics.render_mode {
         RenderMode::Pbr => 0,
         RenderMode::Vanilla => 2,
@@ -171,12 +173,18 @@ pub struct RenderDebugSettings {
     pub play_animations: bool,
     /// Terrain lighting model A/B (gap #6 in
     /// `docs/rendering-mobile-shader-comparison.md`): 0 = dynamic PBR over
-    /// the baked lightmap (current), 1 = flat baked with the time-of-day
-    /// ambient tint, 2 = fully baked albedo × lightmap (mobile port /
-    /// original ground — no day/night response). Rides the shared
-    /// `TerrainRenderParams` buffer, so cycling it never re-prepares a
+    /// the baked lightmap (current), 2 = fully baked albedo × lightmap
+    /// (mobile port / original ground — no day/night response). Rides the
+    /// shared `TerrainRenderParams` buffer, so cycling it never re-prepares a
     /// material (see the bind-group-leak note below). Seeded from
-    /// `graphics.terrain.lighting`.
+    /// `graphics.render_mode` by `seed_terrain_settings_from_config`; there is
+    /// no config field of its own (the old doc here named one that does not
+    /// exist).
+    ///
+    /// 1 was a third mode, `flat_baked`, removed in ferdoran/openroad#5. The
+    /// numbering is deliberately NOT compacted, so `scripts/perf-capture.ps1`
+    /// and any BRP script writing 2 keep selecting baked; every non-zero value
+    /// reads as baked.
     #[inspector(min = 0, max = 2)]
     pub terrain_lighting_mode: u32,
     /// Mirror the baked terrain lightmap's V axis — the pending `.t`
@@ -412,7 +420,6 @@ fn on_settings_changed(
             shadow_strength,
             lighting_mode: match settings.terrain_lighting_mode {
                 0 => TerrainLightingMode::Dynamic,
-                1 => TerrainLightingMode::FlatBaked,
                 _ => TerrainLightingMode::Baked,
             },
             splat_factors: [

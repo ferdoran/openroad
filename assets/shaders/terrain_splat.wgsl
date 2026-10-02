@@ -173,14 +173,15 @@ var lightmap_tex: texture_2d<f32>;
 // `TerrainRenderParams` in block_splat_material.rs):
 //   [0].xy = lightmap UV scale, [0].zw = lightmap UV offset — identity (1,1,0,0) or the
 //            V-flip calibration (1,-1,0,1), a data change instead of a shader edit;
-//   [1].x  = lighting mode: 0 = dynamic PBR (current), 1 = flat baked with time-of-day
-//            ambient tint, 2 = fully baked albedo × lightmap (mobile port / original);
+//   [1].x  = lighting mode: 0 = dynamic PBR (current), 2 = fully baked albedo × lightmap
+//            (mobile port / original). 1 used to be a third "flat baked" mode and is gone
+//            (see TerrainLightingMode); any non-zero value reads as fully baked;
 //   [1].yzw, [2].xy = ground-tile repeat factors for splat-scale codes 0/8/16/24/32
 //            (live calibration sliders in the render-debug panel);
 //   [2].z  = lightmap strength: 1 = vanilla baked shadows, 0 = PBR mode (the
 //            environment plugin's hotkey-N switch swaps them for cascaded shadow
 //            maps). Note: only the dynamic lighting mode substitutes real shadows —
-//            flat_baked/baked bypass apply_pbr_lighting, so strength 0 there just
+//            baked bypasses apply_pbr_lighting, so strength 0 there just
 //            leaves the ground unshaded;
 //   [2].w  = extra sun-shadow darkening (vanilla player-shadow boost, 0 = off/PBR):
 //            multiplies the lit ground by 1-[2].w where the shadow map is fully
@@ -238,9 +239,13 @@ fn fragment(
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
     // Lighting model A/B (`terrain_params[1].x`, uniform across the draw). Both the mobile
     // port and (probably) the original render ground as albedo × baked lightmap with no
-    // dynamic response at all — but fully-baked also kills the time-of-day tint the
-    // environment system drives through the ambient term, so all three variants stay
-    // selectable for the playtest (docs/rendering-mobile-shader-comparison.md, gap #6).
+    // dynamic response at all, so both variants stay selectable for the playtest
+    // (docs/rendering-mobile-shader-comparison.md, gap #6). A third one existed here
+    // ("flat baked": base_color × ambient tint × exposure, no N·L) and was removed — it
+    // scaled the whole ground by the ambient term alone, which in `render_mode: pbr` is
+    // 30x smaller than in vanilla (`pbr_ambient_brightness` 100 vs `ambient_brightness`
+    // 3000) and additionally arrives without the lightmap, so the ground went black
+    // (ferdoran/openroad#5).
     // Fog is unaffected: it lives in main_pass_post_lighting_processing below.
     let lighting_mode = terrain_params[1].x;
     var out: FragmentOutput;
@@ -255,11 +260,6 @@ fn fragment(
         // magnitude too bright.
         let ambient_correction = (ambient_ratio.rgb - vec3(1.0)) * lights.ambient_color.rgb * pbr_input.material.base_color.rgb * view.exposure;
         out.color = vec4(out.color.rgb + ambient_correction, out.color.a);
-    } else if lighting_mode < 1.5 {
-        // flat baked: no N·L/specular, but the terrain ambient color (object ambient ×
-        // terrain ratio) keeps day/night tinting the ground
-        let tint = lights.ambient_color.rgb * ambient_ratio.rgb;
-        out.color = vec4(pbr_input.material.base_color.rgb * tint * view.exposure, pbr_input.material.base_color.a);
     } else {
         // fully baked: the lightmap (already multiplied into base_color above) is the
         // entire lighting, like the original fixed-function ground
@@ -271,7 +271,7 @@ fn fragment(
     // Darken the lit result by the sun's shadow factor directly — a stand-in for the
     // original client's dark projected player shadow (in vanilla mode only the player
     // casts). Sampled manually instead of relying on apply_pbr_lighting so the
-    // flat_baked/baked modes get the player shadow too. terrain_params is a
+    // baked mode gets the player shadow too. terrain_params is a
     // storage buffer (formally non-uniform to WGSL), but the block stays legal:
     // fetch_directional_shadow's hardware path uses textureSampleCompareLevel,
     // which needs no derivatives and is allowed in non-uniform control flow.
@@ -306,7 +306,7 @@ fn prepare_pbr(in: VertexOutput, is_front: bool, color: vec4<f32>) -> PbrInput {
     // bevy's pbr_input_from_vertex_output does, or apply_pbr_lighting never
     // sees MESH_FLAGS_SHADOW_RECEIVER_BIT and terrain silently ignores every
     // shadow map (characters cast onto objects but not the ground). Only the
-    // dynamic lighting mode consumes this; flat/baked bypass PBR lighting.
+    // dynamic lighting mode consumes this; baked bypasses PBR lighting.
     pbr_input.flags = mesh[in.instance_index].flags;
     pbr_input.material.base_color = color;
 //

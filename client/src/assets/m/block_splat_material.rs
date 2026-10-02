@@ -364,10 +364,12 @@ pub struct TerrainAmbientRatioBuffer(pub Buffer);
 ///   this makes the pending flip a data change instead of a shader edit.
 /// - `lighting_mode`: the terrain dynamic-lighting A/B
 ///   (`docs/rendering-mobile-shader-comparison.md` gap #6). `Dynamic` is the
-///   current full PBR sun + ambient over the baked lightmap; `FlatBaked`
-///   drops N·L/specular but keeps the time-of-day ambient tint;
-///   `Baked` is `albedo × lightmap`, full stop — the mobile port's (and
-///   probably the original's) fully-baked ground.
+///   current full PBR sun + ambient over the baked lightmap; `Baked` is
+///   `albedo × lightmap`, full stop — the mobile port's (and probably the
+///   original's) fully-baked ground. A third mode `FlatBaked` (GPU value 1.0)
+///   was removed in ferdoran/openroad#5: it scaled the ground by the ambient
+///   term alone, which in `render_mode: pbr` is 30x smaller than in vanilla
+///   and arrives without the lightmap, so the ground rendered black.
 ///
 /// Kept in step with `graphics.terrain` by `apply_terrain_render_params`
 /// (see [`crate::plugins::settings::live`]); the render-debug panel and the
@@ -418,16 +420,15 @@ impl Default for TerrainRenderParams {
 pub enum TerrainLightingMode {
     /// Full PBR sun + ambient over the baked lightmap (current behavior).
     Dynamic,
-    /// `albedo × lightmap × ambient tint × exposure` — keeps time of day,
-    /// drops N·L and specular.
-    FlatBaked,
     /// `albedo × lightmap` — fully baked ground (mobile port / original).
+    /// Encoded as 2.0, not 1.0: 1.0 was a removed third mode (see the type
+    /// doc) and the panel/`perf-capture.ps1` numbering stays as it was.
     Baked,
 }
 
 impl TerrainRenderParams {
     /// GPU layout: three vec4s — `[0]` = lightmap UV scale.xy + offset.zw,
-    /// `[1].x` = lighting mode as float (shader branches on `< 0.5`/`< 1.5`),
+    /// `[1].x` = lighting mode as float (the shader branches on `< 0.5`),
     /// `[1].yzw` + `[2].xy` = the splat repeat factors for codes 0..32,
     /// `[2].z` = lightmap strength (1 = multiply baked lightmap into albedo,
     /// 0 = off, PBR mode), `[2].w` = extra sun-shadow darkening — unused,
@@ -441,7 +442,6 @@ impl TerrainRenderParams {
         };
         let mode = match self.lighting_mode {
             TerrainLightingMode::Dynamic => 0.0,
-            TerrainLightingMode::FlatBaked => 1.0,
             TerrainLightingMode::Baked => 2.0,
         };
         let f = self.splat_factors.map(|factor| factor.max(0.01));
