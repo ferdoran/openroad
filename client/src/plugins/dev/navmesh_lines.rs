@@ -8,11 +8,19 @@ use crate::plugins::nav::{
     NavLocation, NavMeshRaycast, NavObjectGrid, NavStep, ObjectNavMesh, OBJECT_BLOCK_Y_BAND,
 };
 use crate::plugins::player::Player;
-use bevy::color::palettes::basic::{BLUE, FUCHSIA, GREEN, RED, YELLOW};
+use bevy::color::palettes::basic::{BLUE, FUCHSIA, GREEN, RED};
 use bevy::prelude::*;
 
 /// Lift debug lines slightly above the terrain so they don't z-fight with it.
 const LINE_LIFT: f32 = 1.0;
+/// The three terrain layers draw the *same* lines: an internal edge is a quad
+/// cell's border, and a global edge is a cell border on a region seam. Drawn at
+/// one height they fight for the same pixels (#11), so each layer gets its own,
+/// in the order they should win: cells below, internal edges over them, global
+/// edges on top.
+const CELL_LIFT: f32 = LINE_LIFT;
+const INTERNAL_EDGE_LIFT: f32 = LINE_LIFT + 0.5;
+const GLOBAL_EDGE_LIFT: f32 = LINE_LIFT + 1.0;
 /// Max world-space length of one polyline segment; longer nav lines are subdivided
 /// at this step so they follow the terrain instead of clipping through hills.
 const SEGMENT_STEP: f32 = 40.0;
@@ -50,6 +58,15 @@ const SNAPSHOT_PROBES: usize = 6;
 /// `segments_intersect`).
 const PROBE_OVERSHOOT: f32 = 5.0;
 
+/// Draws the terrain nav mesh of every visible region.
+///
+/// - **blue** — the walkable quad cells
+/// - **yellow** — a *global* edge: the seam the data hands a mover across
+/// - **green** — an *internal* edge between two cells of the same region
+/// - **red** — a blocking entry of either edge list
+///
+/// Yellow is the global edge here because that is what yellow already means in
+/// this file for objects ([`GLOBAL_EDGE_COLOR`]); the two views disagreed.
 pub fn draw_debug_lines_for_nav_mesh(
     mut settings: ResMut<RenderDebugSettings>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -82,7 +99,8 @@ pub fn draw_debug_lines_for_nav_mesh(
 
         let origin = transform.translation();
 
-        // Quadtree cells (walkable rectangles).
+        // Quadtree cells (walkable rectangles), the layer everything else is
+        // drawn over.
         for cell in nav_mesh.quad_cell_list.items.iter() {
             let rect = &cell.rectangle;
             let corners = [
@@ -98,34 +116,39 @@ pub fn draw_debug_lines_for_nav_mesh(
                     origin,
                     corners[i],
                     corners[(i + 1) % 4],
+                    CELL_LIFT,
                     BLUE.into(),
                 );
             }
         }
 
-        // Cell border edges shared between regions / on the region outline.
-        for edge in nav_mesh.global_edge_list.0.iter() {
-            let color = if edge.flag.is_blocked() { RED } else { GREEN };
+        // Cell border edges inside the region.
+        for edge in nav_mesh.internal_edge_list.0.iter() {
+            let color = terrain_edge_color(edge.flag.is_blocked(), false);
             draw_nav_line(
                 &mut gizmos,
                 nav_mesh,
                 origin,
                 edge.line.0,
                 edge.line.1,
-                color.into(),
+                INTERNAL_EDGE_LIFT,
+                color,
             );
         }
 
-        // Cell border edges inside the region.
-        for edge in nav_mesh.internal_edge_list.0.iter() {
-            let color = if edge.flag.is_blocked() { RED } else { YELLOW };
+        // Cell border edges shared between regions / on the region outline —
+        // the handover seam, drawn last and highest because it is the one a
+        // reader is looking for.
+        for edge in nav_mesh.global_edge_list.0.iter() {
+            let color = terrain_edge_color(edge.flag.is_blocked(), true);
             draw_nav_line(
                 &mut gizmos,
                 nav_mesh,
                 origin,
                 edge.line.0,
                 edge.line.1,
-                color.into(),
+                GLOBAL_EDGE_LIFT,
+                color,
             );
         }
     }
@@ -983,18 +1006,25 @@ pub fn draw_nav_cursor_hit(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_nav_line(
     gizmos: &mut Gizmos,
     nav_mesh: &JMXVNVM,
     origin: Vec3,
     from: Vec2,
     to: Vec2,
+    lift: f32,
     color: Color,
 ) {
     let steps = (from.distance(to) / SEGMENT_STEP).ceil().max(1.0) as usize;
-    let mut prev = nav_point(nav_mesh, origin, from);
+    let mut prev = nav_point(nav_mesh, origin, from, lift);
     for i in 1..=steps {
-        let next = nav_point(nav_mesh, origin, from.lerp(to, i as f32 / steps as f32));
+        let next = nav_point(
+            nav_mesh,
+            origin,
+            from.lerp(to, i as f32 / steps as f32),
+            lift,
+        );
         gizmos.line(prev, next, color);
         prev = next;
     }
@@ -1003,11 +1033,47 @@ fn draw_nav_line(
 /// Region-local nav (x, z) → world position draped on the terrain. Regions are
 /// spawned at `x * -REGION_SIZE` with X-mirrored meshes (see terrain/mod.rs), so
 /// local X is negated relative to the region origin.
-fn nav_point(nav_mesh: &JMXVNVM, origin: Vec3, p: Vec2) -> Vec3 {
+fn nav_point(nav_mesh: &JMXVNVM, origin: Vec3, p: Vec2, lift: f32) -> Vec3 {
     let height = nav_mesh.height_map.height_at(p.x, p.y);
-    Vec3::new(
-        origin.x - p.x,
-        origin.y + height + LINE_LIFT,
-        origin.z + p.y,
-    )
+    Vec3::new(origin.x - p.x, origin.y + height + lift, origin.z + p.y)
+}
+
+/// Colour of one terrain nav-mesh edge: blocked beats the list the edge came
+/// from, and an edge that is not blocked says which list that was — yellow for
+/// a global edge, green for one internal to the region.
+fn terrain_edge_color(blocked: bool, global: bool) -> Color {
+    match (blocked, global) {
+        (true, _) => RED.into(),
+        (false, true) => GLOBAL_EDGE_COLOR,
+        (false, false) => GREEN.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #11: "yellow ones should be global edges". Yellow is also what a global
+    /// edge is already drawn in for an object two systems down, so the two
+    /// views now agree.
+    #[test]
+    fn a_passable_global_terrain_edge_is_the_yellow_one() {
+        assert_eq!(terrain_edge_color(false, true), GLOBAL_EDGE_COLOR);
+        assert_ne!(terrain_edge_color(false, false), GLOBAL_EDGE_COLOR);
+        assert_eq!(terrain_edge_color(true, true), Color::from(RED));
+        assert_eq!(terrain_edge_color(true, false), Color::from(RED));
+    }
+
+    /// The three layers draw the *same* lines — an internal edge is a quad
+    /// cell's border — so one shared height is what makes them fight (#11).
+    #[test]
+    fn the_three_terrain_layers_do_not_share_a_height() {
+        let lifts = [CELL_LIFT, INTERNAL_EDGE_LIFT, GLOBAL_EDGE_LIFT];
+        for (i, a) in lifts.iter().enumerate() {
+            for b in &lifts[i + 1..] {
+                assert_ne!(a, b, "two terrain nav layers share a height: {lifts:?}");
+            }
+        }
+        assert!(CELL_LIFT < INTERNAL_EDGE_LIFT && INTERNAL_EDGE_LIFT < GLOBAL_EDGE_LIFT);
+    }
 }
