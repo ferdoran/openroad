@@ -125,13 +125,16 @@ impl Plugin for DevPlugin {
             .add_plugins(FpsOverlayPlugin::default())
             // .add_plugins(DebugLinesPlugin::with_depth_test(true))
             //
-            // `WireframePlugin` and the auto-screenshot harness carry no UI and
-            // no hotkey of their own — the `Q` toggle that drives the wireframe
-            // is in the gated block below — so they stay unconditional.
-            // .add_plugins((
-            //     WireframePlugin::default(),
-            //     auto_screenshot::AutoScreenshotPlugin,
-            // ))
+            // `WireframePlugin` carries no UI and no hotkey of its own, and the
+            // resource that drives it (`RenderDebugSettings`, added above) is
+            // unconditional — so this is too. Without the plugin both wireframe
+            // toggles are dead in a way that reads like a renderer bug: the
+            // components are inserted, nothing draws them, and the compiler
+            // only says `unused import: WireframePlugin`.
+            .add_plugins(WireframePlugin::default())
+            // The auto-screenshot harness stays off — it is a capture tool, not
+            // part of these toggles.
+            // .add_plugins(auto_screenshot::AutoScreenshotPlugin)
             // Always on: the mode switch (Tab — the way *into* debug mode),
             // which claims no letter a vanilla HUD toggle wants. The dev-window
             // button moved into the gated block: it is chrome for tooling that
@@ -154,12 +157,20 @@ impl Plugin for DevPlugin {
             // Both of these are bare-letter hotkey plugins: lighting adjusts
             // on E/T/U/I/P, the glass ball spawns on its own key.
             app.add_plugins((LightingPlugin, GlassballPlugin));
+            // The terrain nav-mesh view: the panel's `render_navmesh` and the
+            // `T` key both live inside this one system, so while it is not
+            // registered the switch and the key are dead and the view cannot be
+            // looked at (#11). `T` is one of the keys DEV_HOTKEY_COLLISIONS
+            // already names — lighting reads it too — which is why this whole
+            // block sits behind `dev_tools`.
+            app.add_systems(Update, draw_debug_lines_for_nav_mesh);
+            // The rest of the block stays off — nothing below is driven by a
+            // switch these two reports name.
             // app.add_systems(
             //     Update,
             //     (
             // toggle_wireframe,
             // draw_debug_lines_for_aabb,
-            // draw_debug_lines_for_nav_mesh,
             // draw_object_nav_meshes,
             // draw_object_global_edges,
             // draw_nav_location,

@@ -66,7 +66,10 @@ impl Plugin for RenderControlsPlugin {
                     on_water_settings_changed,
                 )
                     .run_if(resource_changed::<RenderDebugSettings>),
-            );
+            )
+            // Not under that run condition: it also has to catch meshes that
+            // stream in while the switch is already on — see the system.
+            .add_systems(Update, on_object_wireframe);
     }
 }
 
@@ -327,6 +330,71 @@ fn on_water_settings_changed(
     }
 }
 
+/// The object wireframe, split out for the same reason as the foliage and
+/// water toggles above — plus one of its own: it needs the subtree below each
+/// `MapObject`, which `on_settings_changed` has no room left to query.
+///
+/// The toggle used to put `Wireframe` on a `MapObject`'s **direct** children.
+/// Those children are anchors, not meshes: one `CompoundPart` per `.cpd` part
+/// (`map::objects`), and under it the spawned resource's own root. The
+/// `Mesh3d` entities sit below that, and `Wireframe` is not inherited — so the
+/// switch marked entities that draw nothing and the view stayed empty, while
+/// the terrain switch worked because the terrain entity carries its own mesh.
+///
+/// Runs unconditionally rather than under `resource_changed` like its
+/// neighbours: an object's meshes are spawned asynchronously, after its entity
+/// already exists (`map::objects::spawn_resources_when_loaded`), and regions
+/// keep streaming in while the switch is on. A mesh that arrives later has to
+/// be marked when it arrives, or the view keeps holes that look like the bug
+/// this replaces.
+fn on_object_wireframe(
+    settings: Res<RenderDebugSettings>,
+    mut commands: Commands,
+    objects: Query<Entity, With<MapObject>>,
+    new_meshes: Query<Entity, Added<Mesh3d>>,
+    children: Query<&Children>,
+    parents: Query<&ChildOf>,
+    is_object: Query<(), With<MapObject>>,
+    is_mesh: Query<(), With<Mesh3d>>,
+) {
+    // Whole-world pass whenever a setting moved — including the colour, which
+    // is written even while the switch is off so flipping it on uses it.
+    if settings.is_changed() {
+        for object in objects.iter() {
+            for entity in children.iter_descendants(object) {
+                if !is_mesh.contains(entity) {
+                    continue;
+                }
+                commands.entity(entity).insert(WireframeColor {
+                    color: settings.object_wireframe_color,
+                });
+                match settings.object_wireframe {
+                    true => commands.entity(entity).insert(Wireframe),
+                    false => commands.entity(entity).remove::<Wireframe>(),
+                };
+            }
+        }
+    }
+    // Meshes that streamed in since the last frame, while the switch is on.
+    // Nothing to do when it is off: an unmarked mesh is already the off state.
+    if !settings.object_wireframe {
+        return;
+    }
+    for mesh in new_meshes.iter() {
+        if parents
+            .iter_ancestors(mesh)
+            .any(|ancestor| is_object.contains(ancestor))
+        {
+            commands.entity(mesh).insert((
+                Wireframe,
+                WireframeColor {
+                    color: settings.object_wireframe_color,
+                },
+            ));
+        }
+    }
+}
+
 /// Last-applied values for `on_settings_changed`'s "only write when the flag
 /// actually moved" guards — one struct because the system is at the
 /// 16-system-param limit and can't afford a `Local` per flag.
@@ -346,10 +414,7 @@ fn on_settings_changed(
             Without<MapObject>,
         ),
     >,
-    mut object_query: Query<
-        (&Children, &mut Visibility, Option<&NoAutomaticBatching>),
-        With<MapObject>,
-    >,
+    mut object_query: Query<(&mut Visibility, Option<&NoAutomaticBatching>), With<MapObject>>,
     mut effect_query: Query<
         &mut Visibility,
         (
@@ -504,22 +569,15 @@ fn on_settings_changed(
             false => commands.entity(terrain_entity).remove::<Wireframe>(),
         };
     }
-    for (children, mut visibility, _batching) in object_query.iter_mut() {
+    for (mut visibility, _batching) in object_query.iter_mut() {
         // Inherited, not Visible — same reason as the terrain loop above.
+        // The object wireframe moved to `on_object_wireframe`: it needs the
+        // whole subtree, not these roots.
         *visibility = if settings.render_objects {
             Visibility::Inherited
         } else {
             Visibility::Hidden
         };
-        for child in children.iter() {
-            commands.entity(child).insert(WireframeColor {
-                color: settings.object_wireframe_color,
-            });
-            match settings.object_wireframe {
-                true => commands.entity(child).insert(Wireframe),
-                false => commands.entity(child).remove::<Wireframe>(),
-            };
-        }
     }
     // Guarded like backface_culling: skip the redundant light write (and its
     // change-detection dirtying) when an unrelated panel field moved.
@@ -595,6 +653,93 @@ mod tests {
         assert!(
             app.world().get_resource::<RenderDebugSettings>().is_some(),
             "RenderDebugSettings must be registered independently of `dev_tools`"
+        );
+    }
+
+    /// Helper for the two wireframe tests: the real shape of a map object,
+    /// `MapObject` root -> `.cpd` part anchor -> resource root -> mesh, plus a
+    /// loose mesh that belongs to no object (a player, an effect) which the
+    /// toggle must leave alone.
+    fn spawn_object_tree(world: &mut World) -> (Entity, Entity, Entity, Entity, Entity) {
+        let root = world
+            .spawn(MapObject {
+                id: 1,
+                position: Vec3::ZERO,
+                is_static: true,
+                yaw: 0.0,
+                uid: 1,
+                short_0: 0,
+                is_big: false,
+                is_struct: false,
+                region_id: 0,
+            })
+            .id();
+        let part = world.spawn(ChildOf(root)).id();
+        let resource_root = world.spawn(ChildOf(part)).id();
+        let mesh = world
+            .spawn((Mesh3d(Handle::default()), ChildOf(resource_root)))
+            .id();
+        let loose_mesh = world.spawn(Mesh3d(Handle::default())).id();
+        (root, part, resource_root, mesh, loose_mesh)
+    }
+
+    /// The reported bug (ferdoran#12): the switch marked a `MapObject`'s
+    /// *direct* children. Those are anchors — the `.cpd` part, then the
+    /// resource root — the meshes hang below them, and `Wireframe` is not
+    /// inherited, so nothing was ever drawn. Hence both halves are asserted:
+    /// the mesh carries the marker, the anchors do not.
+    #[test]
+    fn object_wireframe_marks_the_mesh_not_the_anchors() {
+        let mut world = World::new();
+        world.insert_resource(RenderDebugSettings {
+            object_wireframe: true,
+            ..RenderDebugSettings::default()
+        });
+        let (root, part, resource_root, mesh, loose_mesh) = spawn_object_tree(&mut world);
+
+        world
+            .run_system_once(on_object_wireframe)
+            .expect("the system runs");
+
+        assert!(
+            world.entity(mesh).contains::<Wireframe>(),
+            "the entity that owns the mesh has to carry the marker"
+        );
+        assert!(
+            world.entity(mesh).contains::<WireframeColor>(),
+            "and the colour with it, or it draws in the global default"
+        );
+        for anchor in [root, part, resource_root] {
+            assert!(
+                !world.entity(anchor).contains::<Wireframe>(),
+                "a marker on an anchor draws nothing — that was the bug"
+            );
+        }
+        assert!(
+            !world.entity(loose_mesh).contains::<Wireframe>(),
+            "a mesh outside any map object is not this toggle's business"
+        );
+    }
+
+    /// The off direction, which only the settings pass can do: a mesh that was
+    /// marked has to lose the marker again, or the switch is one-way.
+    #[test]
+    fn object_wireframe_clears_the_mesh_when_switched_off() {
+        let mut world = World::new();
+        world.insert_resource(RenderDebugSettings {
+            object_wireframe: false,
+            ..RenderDebugSettings::default()
+        });
+        let (_, _, _, mesh, _) = spawn_object_tree(&mut world);
+        world.entity_mut(mesh).insert(Wireframe);
+
+        world
+            .run_system_once(on_object_wireframe)
+            .expect("the system runs");
+
+        assert!(
+            !world.entity(mesh).contains::<Wireframe>(),
+            "switching the toggle off has to take the marker back off the mesh"
         );
     }
 
