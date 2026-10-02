@@ -65,7 +65,7 @@ use crate::plugins::textdata::{
 };
 use crate::plugins::world_origin::{set_dungeon_origin, set_world_origin, WorldOrigin};
 use crate::scenes::intro_v2::character_select::{JoiningCharacter, PendingWorldJoin};
-use crate::scenes::loading_screen::{spawn_loading_chrome, LoadingProgress};
+use crate::scenes::loading_screen::{spawn_loading_surface, LoadingProgress};
 use crate::scenes::world_scene::{preload_starting_area, set_origin_to_spawn_point, SpawnPoints};
 use crate::scenes::SceneState;
 use crate::util::mesh::{mirrored, needs_winding_reversal};
@@ -389,6 +389,8 @@ fn spawn_game_loading_overlay(
                 height: Val::Percent(100.0),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
+                // the 4:3 cover box overflows on the axis that does not fit
+                overflow: bevy::ui::Overflow::clip(),
                 ..default()
             },
             BackgroundColor(Color::BLACK),
@@ -398,28 +400,12 @@ fn spawn_game_loading_overlay(
             UiTargetCamera(camera),
         ))
         .with_children(|parent| {
-            // stretched over the whole overlay, not letterboxed: the chrome
-            // below is placed as percentages of the same box, so a centred
-            // `max_width` background would leave the frame floating off it
-            parent.spawn((
-                ImageNode {
-                    image: background,
-                    image_mode: NodeImageMode::Stretch,
-                    ..default()
-                },
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: Val::Px(0.0),
-                    top: Val::Px(0.0),
-                    width: Val::Percent(100.0),
-                    height: Val::Percent(100.0),
-                    ..default()
-                },
-                Pickable::IGNORE,
-            ));
-            // with the gauge: `dismiss_loading_overlay_when_ready` reports
-            // the world-entry readiness into it
-            spawn_loading_chrome(parent, &asset_server, true);
+            // Background and chrome both keep the authored 4:3: the art fills the
+            // window cropped, the chrome sits in the centred 4:3 box — stretching
+            // both to the window distorts them (`loading_screen::DESIGN_ASPECT`).
+            // With the gauge: `dismiss_loading_overlay_when_ready` reports the
+            // world-entry readiness into it.
+            spawn_loading_surface(parent, &asset_server, background, true);
         });
 }
 

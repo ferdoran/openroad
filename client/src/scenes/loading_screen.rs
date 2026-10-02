@@ -1,9 +1,12 @@
 use bevy::app::{App, Plugin};
-use bevy::asset::{AssetServer, Handle, UntypedHandle};
+use bevy::asset::{Asset, AssetServer, Handle, HandleTemplate, UntypedHandle};
 use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::default;
 use bevy::prelude::*;
-use bevy::ui::{PositionType, Val};
+use bevy::reflect::TypePath;
+use bevy::render::render_resource::AsBindGroup;
+use bevy::shader::ShaderRef;
+use bevy::ui::{Overflow, PositionType, Val};
 use iyes_progress::ProgressTracker;
 use rand::Rng;
 
@@ -15,7 +18,8 @@ pub struct LoadingScenePlugin;
 
 impl Plugin for LoadingScenePlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(LoadingScreen::new())
+        app.add_plugins(UiMaterialPlugin::<LoadingBackdropMaterial>::default())
+            .insert_resource(LoadingScreen::new())
             .add_systems(OnEnter(SceneState::Loading), setup_loading_screen)
             .add_systems(
                 OnExit(SceneState::Loading),
@@ -28,7 +32,14 @@ impl Plugin for LoadingScenePlugin {
                 Update,
                 loading_progress.run_if(in_state(SceneState::Loading)),
             )
-            .add_systems(Update, loaded_system.run_if(in_state(GameState::Loaded)));
+            .add_systems(Update, loaded_system.run_if(in_state(GameState::Loaded)))
+            // ungated on purpose: the same boxes carry the world-entry
+            // overlay, the creation cut and the char-select join overlay,
+            // which live in other scenes. Query-only, so it is safe there and
+            // in the headless harnesses. `attach_backdrop_material` rides along
+            // for the same reason: the backdrop is spawned on all four surfaces
+            // and only this plugin owns its material store.
+            .add_systems(Update, (fit_design_surfaces, attach_backdrop_material));
     }
 }
 
@@ -43,15 +54,15 @@ const DESIGN: (f32, f32) = (1600.0, 1200.0);
 
 /// `GDR_LOADINGFRAME:CIFStatic` id 23, `Rect="241,973,1121,64"`,
 /// `loading_form.ddj` (art 720x40, stretched) — `pscharacterselect.txt:345`.
-const FRAME_RECT: (f32, f32, f32, f32) = (241.0, 973.0, 1121.0, 64.0);
+pub const FRAME_RECT: (f32, f32, f32, f32) = (241.0, 973.0, 1121.0, 64.0);
 /// `GDR_LOADINGG:CIFGauge` id 24, `Rect="268,985,1064,20"`,
 /// `gauge_loading.ddj` — `pscharacterselect.txt:326`.
-const GAUGE_RECT: (f32, f32, f32, f32) = (268.0, 985.0, 1064.0, 20.0);
+pub const GAUGE_RECT: (f32, f32, f32, f32) = (268.0, 985.0, 1064.0, 20.0);
 /// `GDR_LOADING_STA:CIFStatic` id 27, `Rect="268,1025,252,35"`,
 /// `nowloading.ddj` — `pscharacterselect.txt:307`. The caption is **baked art**
 /// (144x20, stretched into the 252x35 rect), not a string: there is no
 /// "Now Loading" key anywhere in `textuisystem.txt`.
-const CAPTION_RECT: (f32, f32, f32, f32) = (268.0, 1025.0, 252.0, 35.0);
+pub const CAPTION_RECT: (f32, f32, f32, f32) = (268.0, 1025.0, 252.0, 35.0);
 
 /// The gauge art is a 4x12 **cross-section**: all four columns are byte-
 /// identical while the twelve rows form a vertical gold gradient, so the fill
@@ -61,6 +72,215 @@ const GAUGE_DDJ: &str = "media://interface/loading/gauge_loading.ddj";
 const FRAME_DDJ: &str = "media://interface/loading/loading_form.ddj";
 const CAPTION_DDJ: &str = "media://interface/loading/nowloading.ddj";
 
+/// Aspect of everything on this screen. The design canvas is 1600x1200 and
+/// **all 40** loading backgrounds in `Media/interface/loading/` are 1024x768 —
+/// both 4:3. The authored chrome only *looks* right at that ratio, and the data
+/// says so rather than taste: the caption rect `268,1025,252,35` has the
+/// on-screen aspect `5.4 * (W/H)`, which equals `144/20 = 7.2` — the exact
+/// aspect of `nowloading.ddj` — precisely when `W/H = 4/3`.
+///
+/// DEVIATION, deliberate: the original gives no answer for a non-4:3 window.
+/// Stretching art and chrome to the window would squash the painting and the
+/// "now loading" strip on every 16:9 screen, so the ratio is kept instead:
+/// painting *and* chrome sit in the largest centred 4:3 box that fits
+/// (*contain*), which reproduces the authored proportions at any window size.
+///
+/// Letting the painting *cover* the window instead looks zoomed in: at 21:9
+/// cover eats ~44% of the picture, and being uncropped in one axis does not
+/// make that the whole painting. Hence the third box: the leftover area is not
+/// black bars but the *same* picture blown up to cover, blurred and dimmed
+/// ([`BACKDROP_BLUR`], [`BACKDROP_BRIGHTNESS`]), so the painting ends in its
+/// own colours. Nothing of the art is lost and nothing is stretched.
+pub const DESIGN_ASPECT: f32 = DESIGN.0 / DESIGN.1;
+
+/// How a loading surface maps the 4:3 design space onto the window.
+/// [`fit_design_surfaces`] writes the resulting pixel rect every time the
+/// window changes; the children stay in percentages of it.
+/// A struct with one flag rather than a two-variant enum because the
+/// `bsn!` scenes have to spell it too (`DesignFit { cover: true }`), and the
+/// macro's enum patches need generated `default_*` constructors the field
+/// form does not.
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct DesignFit {
+    /// `true`: fill the window and crop the overflow — the blurred backdrop.
+    /// `false`: largest 4:3 box that fits, centred — the painting and the
+    /// authored chrome.
+    pub cover: bool,
+}
+
+impl DesignFit {
+    /// Fill the window, keep 4:3, crop what does not fit.
+    pub const COVER: Self = Self { cover: true };
+    /// Largest centred 4:3 box inside the window.
+    pub const CONTAIN: Self = Self { cover: false };
+}
+
+/// Blur radius of the backdrop, as a fraction of the cover box's height.
+///
+/// Chosen by eye against the real art at 16:9 and 21:9: below ~0.05 the
+/// backdrop still reads as a second, wrongly-cropped picture competing with
+/// the painting; above ~0.12 it is an even smear that no longer echoes the
+/// composition. The value is a fraction, not pixels, so the effect is the same
+/// on a 1280 and a 3440 window.
+///
+/// `assets/shaders/loading_backdrop.wgsl` explains how a radius this wide is
+/// gathered in 25 taps without ghosting the paintings' hard silhouettes — and
+/// why that method does not depend on the mip chain, which 18 of the 40 vanilla
+/// backgrounds do not have.
+pub const BACKDROP_BLUR: f32 = 0.09;
+
+/// Brightness of the backdrop, as a **linear** factor (UI shaders work in
+/// linear space, the art is sRGB): `0.18` linear is `0.18^(1/2.2) ~= 0.45` of
+/// the original as the eye sees it. That is the level at which the painting
+/// clearly reads as the foreground while the leftover area still carries its
+/// colours instead of going black.
+pub const BACKDROP_BRIGHTNESS: f32 = 0.18;
+
+/// The blur-and-dim material of the backdrop
+/// (`assets/shaders/loading_backdrop.wgsl` states the idea and the method).
+///
+/// `settings` is one `Vec4` rather than two `f32` uniforms because a uniform
+/// buffer binding is 16-byte aligned anyway — two scalars would occupy the
+/// same 16 bytes and need two bindings.
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+pub struct LoadingBackdropMaterial {
+    /// `x` = blur radius in UV, `y` = linear brightness, `zw` unused.
+    #[uniform(0)]
+    pub settings: Vec4,
+    #[texture(1)]
+    #[sampler(2)]
+    pub art: Handle<Image>,
+}
+
+impl UiMaterial for LoadingBackdropMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/loading_backdrop.wgsl".into()
+    }
+}
+
+/// Marks a node as the blurred backdrop for `art`; [`attach_backdrop_material`]
+/// turns it into a [`MaterialNode`].
+///
+/// Why the indirection instead of spawning the `MaterialNode` directly: the
+/// fourth loading surface is a `bsn!` scene
+/// (`intro_v2::character_select::join_loading_overlay`) which gets no
+/// `Assets<LoadingBackdropMaterial>` to `add()` a material to. A marker that
+/// one system resolves keeps all four surfaces on the same code instead of
+/// giving that one its own backdrop.
+/// A tuple struct, and `Default` + `FromTemplate` are what `bsn!` needs to
+/// spell this component in the fourth surface: the macro's pseudo-specialised `FromTemplate` path wants
+/// both, and an asset handle only gets one through `HandleTemplate` — the same
+/// pattern `ui_v2::style::ButtonSound` uses for its handle field.
+#[derive(Component, Clone, Debug, Default, FromTemplate)]
+pub struct LoadingBackdrop(#[template(HandleTemplate<Image>)] pub Handle<Image>);
+
+/// Give every [`LoadingBackdrop`] its material, once.
+///
+/// `Assets<LoadingBackdropMaterial>` is inserted by the `UiMaterialPlugin` this
+/// plugin adds, so it exists wherever this system is registered — unlike a
+/// scene resource it cannot go missing.
+pub fn attach_backdrop_material(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<LoadingBackdropMaterial>>,
+    pending: Query<(Entity, &LoadingBackdrop), Without<MaterialNode<LoadingBackdropMaterial>>>,
+) {
+    for (entity, backdrop) in pending.iter() {
+        let material = materials.add(LoadingBackdropMaterial {
+            settings: Vec4::new(BACKDROP_BLUR, BACKDROP_BRIGHTNESS, 0.0, 0.0),
+            art: backdrop.0.clone(),
+        });
+        commands.entity(entity).insert(MaterialNode(material));
+    }
+}
+
+/// The node a [`DesignFit`] entity starts with: absolutely positioned, sized
+/// by [`fit_design_surfaces`]. `Val::Px(0.0)` here is a placeholder, not a
+/// layout — the system overwrites all four fields on its first run.
+pub fn design_fit_node() -> Node {
+    Node {
+        position_type: PositionType::Absolute,
+        left: Val::Px(0.0),
+        top: Val::Px(0.0),
+        width: Val::Px(0.0),
+        height: Val::Px(0.0),
+        ..default()
+    }
+}
+
+/// The pixel rect a [`DesignFit`] box gets in a `win_w` x `win_h` window,
+/// as `(left, top, width, height)`. Centred on both axes; a cover box gets a
+/// negative offset on the axis it overflows.
+///
+/// Pure, because that is where the property worth pinning lives: the ratio of
+/// the returned box is [`DESIGN_ASPECT`] whatever the window does, so every
+/// percentage rect inside it keeps the aspect it was authored with.
+pub fn design_fit_rect(win_w: f32, win_h: f32, fit: DesignFit) -> (f32, f32, f32, f32) {
+    let window_is_wider = win_w / win_h > DESIGN_ASPECT;
+    // cover: the *other* axis overflows; contain: it is the one that fits
+    let match_width = if fit.cover {
+        window_is_wider
+    } else {
+        !window_is_wider
+    };
+    let (w, h) = if match_width {
+        (win_w, win_w / DESIGN_ASPECT)
+    } else {
+        (win_h * DESIGN_ASPECT, win_h)
+    };
+    ((win_w - w) / 2.0, (win_h - h) / 2.0, w, h)
+}
+
+/// Size every [`DesignFit`] box against the current window.
+///
+/// A plain `Query`-only system, so it is safe in every scene and in the
+/// headless harnesses (no scene resource, nothing to fail parameter
+/// validation on) — with no window and no tagged entity it does nothing.
+/// Writes are guarded so an idle frame marks no node changed.
+pub fn fit_design_surfaces(
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    mut fitted: Query<(&DesignFit, &mut Node)>,
+) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let (win_w, win_h) = (window.resolution.width(), window.resolution.height());
+    if win_w <= 0.0 || win_h <= 0.0 {
+        return;
+    }
+    for (fit, mut node) in fitted.iter_mut() {
+        let (left, top, w, h) = design_fit_rect(win_w, win_h, *fit);
+        // One comparison before the first `DerefMut`: touching any field of a
+        // `Mut<Node>` marks the whole component changed, so a per-field guard
+        // would still repaint the surface every frame.
+        if (node.left, node.top, node.width, node.height)
+            != (Val::Px(left), Val::Px(top), Val::Px(w), Val::Px(h))
+        {
+            node.left = Val::Px(left);
+            node.top = Val::Px(top);
+            node.width = Val::Px(w);
+            node.height = Val::Px(h);
+        }
+    }
+}
+
+/// Design-space rect -> `(left, top, width, height)` in **percent** of the
+/// window, so the 1600x1200 layout scales instead of assuming a resolution.
+///
+/// Split out of [`design_node`] because a fourth surface needs the numbers
+/// without the node: the char-select join overlay is a `bsn!` scene
+/// (`intro_v2::character_select::join_loading_overlay`), which cannot call a
+/// `ChildSpawnerCommands` helper. Sharing the conversion keeps the two
+/// renderers from drifting even though they cannot share the spawn code.
+pub fn design_pct(rect: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+    let (x, y, w, h) = rect;
+    (
+        100.0 * x / DESIGN.0,
+        100.0 * y / DESIGN.1,
+        100.0 * w / DESIGN.0,
+        100.0 * h / DESIGN.1,
+    )
+}
+
 /// Design-space rect -> percentage node, so the 1600x1200 layout scales with
 /// the window instead of assuming a resolution.
 ///
@@ -69,15 +289,60 @@ const CAPTION_DDJ: &str = "media://interface/loading/nowloading.ddj";
 /// `intro_v2::region_select`) and every one of them that re-derived the
 /// geometry got it wrong — see [`spawn_loading_chrome`].
 pub fn design_node(rect: (f32, f32, f32, f32)) -> Node {
-    let (x, y, w, h) = rect;
+    let (left, top, width, height) = design_pct(rect);
     Node {
         position_type: PositionType::Absolute,
-        left: Val::Percent(100.0 * x / DESIGN.0),
-        top: Val::Percent(100.0 * y / DESIGN.1),
-        width: Val::Percent(100.0 * w / DESIGN.0),
-        height: Val::Percent(100.0 * h / DESIGN.1),
+        left: Val::Percent(left),
+        top: Val::Percent(top),
+        width: Val::Percent(width),
+        height: Val::Percent(height),
         ..default()
     }
+}
+
+/// Spawns a whole loading surface into `parent`: the blurred backdrop in a
+/// [`DesignFit::COVER`] box, then the painting and the authored chrome in a
+/// [`DesignFit::CONTAIN`] box.
+///
+/// Idea: the three boxes keep the screen from stretching with the window and
+/// from looking zoomed in — see [`DESIGN_ASPECT`] for the numbers and the stated
+/// deviation. `parent` must be a full-window node with
+/// `Overflow::clip()`, because the cover box deliberately overflows it on the
+/// axis that does not fit.
+pub fn spawn_loading_surface(
+    parent: &mut ChildSpawnerCommands,
+    asset_server: &AssetServer,
+    background: Handle<Image>,
+    with_gauge: bool,
+) {
+    parent.spawn((
+        DesignFit::COVER,
+        design_fit_node(),
+        LoadingBackdrop(background.clone()),
+        Name::from("Loading Backdrop"),
+        Pickable::IGNORE,
+    ));
+    parent.spawn((
+        DesignFit::CONTAIN,
+        design_fit_node(),
+        ImageNode {
+            image: background,
+            image_mode: NodeImageMode::Stretch,
+            ..default()
+        },
+        Name::from("Loading Background"),
+        Pickable::IGNORE,
+    ));
+    parent
+        .spawn((
+            DesignFit::CONTAIN,
+            design_fit_node(),
+            Name::from("Loading Chrome"),
+            Pickable::IGNORE,
+        ))
+        .with_children(|chrome| {
+            spawn_loading_chrome(chrome, asset_server, with_gauge);
+        });
 }
 
 /// Spawns the authored loading chrome — frame, optional gauge, caption art —
@@ -184,6 +449,10 @@ fn setup_loading_screen(mut commands: Commands, asset_server: Res<AssetServer>) 
                 top: Val::Px(0.0),
                 width: Val::Percent(100.0),
                 height: Val::Percent(100.0),
+                // the backdrop's cover box overflows this node on the axis
+                // that does not fit 4:3; without the clip it would paint
+                // outside the window
+                overflow: Overflow::clip(),
                 ..default()
             },
             LoadingBarComp,
@@ -191,23 +460,9 @@ fn setup_loading_screen(mut commands: Commands, asset_server: Res<AssetServer>) 
             RenderLayers::layer(CameraLayers::LoadingScreen.into()),
         ))
         .with_children(|screen| {
-            // 1024x768 art stretched over the whole 1600x1200 layout
-            screen.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: Val::Px(0.0),
-                    top: Val::Px(0.0),
-                    width: Val::Percent(100.0),
-                    height: Val::Percent(100.0),
-                    ..default()
-                },
-                ImageNode {
-                    image: background_handle,
-                    image_mode: NodeImageMode::Stretch,
-                    ..default()
-                },
-            ));
-            spawn_loading_chrome(screen, &asset_server, true);
+            // blurred fill in a 4:3 cover box, the 1024x768 painting and the
+            // chrome in the 4:3 contain box on top of it
+            spawn_loading_surface(screen, &asset_server, background_handle, true);
         });
     info!("initialized loading screen");
 }
@@ -226,6 +481,26 @@ pub(crate) struct LoadingBar {
 
 #[derive(Component)]
 pub(crate) struct LoadingProgress(f32);
+
+/// Sets every gauge fill in `bars` to `fraction` (clamped to `0..=1`).
+///
+/// Why this lives here and not at the caller: the fill is *this* module's
+/// widget — a zero-width child of the authored `GDR_LOADINGG` rect whose width
+/// is a percentage of it (see [`spawn_loading_chrome`]) — and the in-scene
+/// loading screen already drives it that way from `iyes_progress`
+/// ([`loading_progress`]). The region board has its own progress source (the
+/// creation screen's asset load)
+/// but must not grow a second answer to "how does a gauge get filled".
+pub(crate) fn set_gauge_fraction(
+    bars: &mut Query<(&mut Node, &mut LoadingProgress)>,
+    fraction: f32,
+) {
+    let fraction = fraction.clamp(0.0, 1.0);
+    for (mut node, mut bar) in bars.iter_mut() {
+        bar.0 = fraction;
+        node.width = Val::Percent(100.0 * fraction);
+    }
+}
 
 #[derive(Component)]
 pub struct LoadingBarComp;
@@ -428,6 +703,211 @@ mod test {
         let (app, root) = chrome_app(true);
         // frame + gauge + fill + caption
         assert_eq!(descendants(&app, root).len(), 4);
+    }
+
+    /// The chrome must keep its authored aspect at any window size.
+    ///
+    /// What this pins: the caption rect `268,1025,252,35` in the
+    /// 1600x1200 canvas has the on-screen aspect `5.4 * (box_w/box_h)`, and
+    /// `nowloading.ddj` is 144x20 = 7.2 — so the authored geometry is correct
+    /// exactly at 4:3 and at no other ratio. Inside a [`DesignFit`] box the
+    /// caption therefore keeps the art's aspect at *any* window size.
+    ///
+    /// The RED control is the second half of the test: the same arithmetic
+    /// against the full window misses 7.2 by 33% at 16:9 and by 79% at 21:9.
+    /// Without it a green here would only be saying that 4:3 is 4:3.
+    #[test]
+    fn the_caption_keeps_the_arts_aspect_in_a_design_box_and_not_in_the_window() {
+        const ART_ASPECT: f32 = 144.0 / 20.0; // nowloading.ddj, DDS header
+        let caption_aspect = |box_w: f32, box_h: f32| {
+            let (_, _, w, h) = design_pct(CAPTION_RECT);
+            (w / 100.0 * box_w) / (h / 100.0 * box_h)
+        };
+
+        for (win_w, win_h) in [
+            (1024.0, 768.0),
+            (1280.0, 720.0),
+            (1920.0, 1080.0),
+            (3440.0, 1440.0),
+            (1080.0, 1920.0),
+        ] {
+            for fit in [DesignFit::COVER, DesignFit::CONTAIN] {
+                let (left, top, w, h) = design_fit_rect(win_w, win_h, fit);
+                // the box is 4:3 and centred, whatever the window is
+                assert!(
+                    (w / h - DESIGN_ASPECT).abs() < 1e-3,
+                    "{fit:?} {win_w}x{win_h}"
+                );
+                assert!((left - (win_w - w) / 2.0).abs() < 1e-3);
+                assert!((top - (win_h - h) / 2.0).abs() < 1e-3);
+                // and the caption drawn in it has the art's proportions
+                assert!(
+                    (caption_aspect(w, h) - ART_ASPECT).abs() < 1e-2,
+                    "{fit:?} at {win_w}x{win_h}: caption aspect {}",
+                    caption_aspect(w, h)
+                );
+            }
+            // cover fills the window, contain fits inside it
+            let (_, _, cover_w, cover_h) = design_fit_rect(win_w, win_h, DesignFit::COVER);
+            assert!(cover_w >= win_w - 1e-3 && cover_h >= win_h - 1e-3);
+            let (_, _, fit_w, fit_h) = design_fit_rect(win_w, win_h, DesignFit::CONTAIN);
+            assert!(fit_w <= win_w + 1e-3 && fit_h <= win_h + 1e-3);
+        }
+
+        // RED control: full-window placement is only right at 4:3
+        assert!((caption_aspect(1024.0, 768.0) - ART_ASPECT).abs() < 1e-2);
+        assert!(caption_aspect(1920.0, 1080.0) > ART_ASPECT * 1.3);
+        assert!(caption_aspect(3440.0, 1440.0) > ART_ASPECT * 1.7);
+    }
+
+    /// A covered loading screen looks zoomed in.
+    ///
+    /// The number that makes cover the wrong answer, and the reason the third
+    /// box exists: at 3440x1440 a 4:3 cover box throws away 44% of the
+    /// painting, at 16:9 a quarter of it. Contain throws away nothing — it
+    /// leaves 44%/25% of the *window* over instead, which is what the blurred
+    /// backdrop fills.
+    ///
+    /// The RED control is the cover column: if someone re-points the painting
+    /// at `DesignFit::COVER`, `visible_fraction` is no longer 1.0 and the
+    /// first assertion fails.
+    #[test]
+    fn cover_crops_the_painting_and_contain_does_not() {
+        // how much of the 4:3 art survives in a box fitted this way
+        let visible_fraction = |win_w: f32, win_h: f32, fit: DesignFit| {
+            let (_, _, w, h) = design_fit_rect(win_w, win_h, fit);
+            // the visible part is the intersection of box and window
+            (w.min(win_w) / w) * (h.min(win_h) / h)
+        };
+
+        for (win_w, win_h, cover_crop) in [
+            (1600.0, 900.0, 0.25),
+            (1920.0, 1080.0, 0.25),
+            (3440.0, 1440.0, 0.442),
+            // portrait: 4:3 has to grow even further to cover it
+            (1080.0, 1920.0, 0.578),
+        ] {
+            // the painting is drawn whole, whatever the window
+            assert!(
+                (visible_fraction(win_w, win_h, DesignFit::CONTAIN) - 1.0).abs() < 1e-3,
+                "contain crops at {win_w}x{win_h}"
+            );
+            // what cover costs
+            let lost = 1.0 - visible_fraction(win_w, win_h, DesignFit::COVER);
+            assert!(
+                (lost - cover_crop).abs() < 5e-3,
+                "cover at {win_w}x{win_h} crops {lost}, expected {cover_crop}"
+            );
+            // and that is exactly the share of the window the backdrop fills
+            let (_, _, w, h) = design_fit_rect(win_w, win_h, DesignFit::CONTAIN);
+            let filled = (w * h) / (win_w * win_h);
+            assert!((1.0 - filled - cover_crop).abs() < 5e-3);
+        }
+
+        // at 4:3 there is nothing to fill and nothing to crop: the two boxes
+        // coincide, so the backdrop is invisible rather than a second look
+        assert_eq!(
+            design_fit_rect(1024.0, 768.0, DesignFit::COVER),
+            design_fit_rect(1024.0, 768.0, DesignFit::CONTAIN)
+        );
+    }
+
+    /// The surface is backdrop + painting + chrome, the backdrop covers, the
+    /// painting is contained, and both show the *same* picture — the backdrop
+    /// echoing the painting is the whole idea (`BACKDROP_BLUR`).
+    #[test]
+    fn the_surface_puts_the_painting_in_the_contain_box_over_a_covering_backdrop() {
+        let mut app = App::new();
+        app.add_plugins((
+            bevy::app::TaskPoolPlugin::default(),
+            bevy::asset::AssetPlugin::default(),
+        ))
+        .init_asset::<Image>()
+        .init_asset::<LoadingBackdropMaterial>();
+
+        let root = app
+            .world_mut()
+            .run_system_cached(|mut commands: Commands, assets: Res<AssetServer>| {
+                let art: Handle<Image> = assets.load("media://interface/loading/x.ddj");
+                commands
+                    .spawn(design_fit_node())
+                    .with_children(|parent| {
+                        spawn_loading_surface(parent, &assets, art, true);
+                    })
+                    .id()
+            })
+            .expect("spawn_loading_surface failed");
+
+        let children: Vec<Entity> = app
+            .world()
+            .get::<Children>(root)
+            .expect("no surface")
+            .iter()
+            .collect();
+        assert_eq!(children.len(), 3, "backdrop + painting + chrome");
+        let (backdrop, painting, chrome) = (children[0], children[1], children[2]);
+
+        // the backdrop is the only box that covers, and it is not an ImageNode
+        // (its material blurs and dims the art instead)
+        assert_eq!(
+            app.world().get::<DesignFit>(backdrop),
+            Some(&DesignFit::COVER)
+        );
+        assert!(app.world().get::<ImageNode>(backdrop).is_none());
+        assert_eq!(
+            app.world().get::<DesignFit>(painting),
+            Some(&DesignFit::CONTAIN)
+        );
+        assert_eq!(
+            app.world().get::<DesignFit>(chrome),
+            Some(&DesignFit::CONTAIN)
+        );
+
+        // same picture in both, or the backdrop stops echoing the painting
+        let art_of_backdrop = app
+            .world()
+            .get::<LoadingBackdrop>(backdrop)
+            .expect("marker")
+            .0
+            .clone();
+        let art_of_painting = app
+            .world()
+            .get::<ImageNode>(painting)
+            .expect("painting")
+            .image
+            .clone();
+        assert_eq!(art_of_backdrop, art_of_painting);
+
+        // the chrome is drawn after the painting, i.e. on top of it
+        assert!(app.world().get::<Children>(chrome).is_some());
+
+        // and the marker becomes a material exactly once
+        app.world_mut()
+            .run_system_cached(attach_backdrop_material)
+            .expect("attach_backdrop_material failed");
+        let material = app
+            .world()
+            .get::<MaterialNode<LoadingBackdropMaterial>>(backdrop)
+            .expect("backdrop has no material")
+            .0
+            .clone();
+        let materials = app.world().resource::<Assets<LoadingBackdropMaterial>>();
+        assert_eq!(materials.len(), 1);
+        let material = materials.get(&material).expect("material asset");
+        assert_eq!(material.settings.x, BACKDROP_BLUR);
+        assert_eq!(material.settings.y, BACKDROP_BRIGHTNESS);
+        assert_eq!(material.art, art_of_painting);
+
+        // a second run must not add a second material for the same node
+        app.world_mut()
+            .run_system_cached(attach_backdrop_material)
+            .expect("attach_backdrop_material failed");
+        assert_eq!(
+            app.world()
+                .resource::<Assets<LoadingBackdropMaterial>>()
+                .len(),
+            1
+        );
     }
 
     /// Design rects become percentages of the window, not pixels.
