@@ -13,6 +13,14 @@
 //! (which also enables the staged fail-safe below). That is why the packet
 //! itself (`CharacterDataBody` in `ingame.rs`) still carries raw bytes.
 //!
+//! An item record whose class the resolver cannot pin has no derivable width,
+//! so it stops its section. Two things then happen, in this order, and the
+//! order is the point (see `recover_item_stop` and `read_anchored_tail_rest`):
+//! first the tail behind the anchor is rebuilt **without any guessing**, so an
+//! unknown item can never again cost the rest of the packet; only then is the
+//! record's width *tested* by replay. A replay that cannot decide says so out
+//! loud (`resync_ambiguous`) instead of quietly keeping the damage.
+//!
 //! Each section is a stage; the first read error stops the forward pass and
 //! records the stage name, so a layout drift degrades to a partial result
 //! instead of a desync. Because a mis-parsed variable-length middle would
@@ -191,6 +199,14 @@ pub enum ItemTypeData {
     /// now fails fast on `ItemClass::Unknown` instead — unless a resync
     /// proved the body's width from the whole blob (`recovered_body`), in
     /// which case the skipped bytes land here too, uninterpreted.
+    ///
+    /// Read the sentence above again before writing the next resync: **it is
+    /// the answer**. On 2026-10-02 the same ref 46551 with the same
+    /// `stack: u16` body cost a live character 189 of 639 bytes, because the
+    /// resync asked the blob a question it could not answer instead of
+    /// believing a measurement that had been in this file for seven weeks. The
+    /// width the repaired resync now derives is 2 — exactly what this comment
+    /// says.
     Unknown,
 }
 
@@ -564,6 +580,20 @@ pub struct ParsedCharacterInfo {
     /// proved. Diagnostics — the record itself is in the inventory with an
     /// [`ItemTypeData::Unknown`] body.
     pub recovered_body: Option<RecoveredItemBody>,
+    /// Set when the resync found *several* widths that each explain the whole
+    /// blob. We then recover nothing (guessing one would be a coin toss), but
+    /// the collision is reported rather than swallowed: a silent "could not" is
+    /// how this packet lost 189 bytes for weeks.
+    pub resync_ambiguous: Option<ResyncAmbiguity>,
+}
+
+/// An unresolvable record whose width could not be pinned because more than one
+/// candidate width consumes the blob. Carries the colliding widths so a live
+/// log names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResyncAmbiguity {
+    pub ref_id: u32,
+    pub widths: Vec<usize>,
 }
 
 /// An unresolvable record whose body width was recovered by resync.
@@ -594,12 +624,51 @@ pub struct ItemSection {
 }
 
 /// Where an item section stopped short: the record index, its start offset in
-/// the blob, and the ref id whose class could not be resolved.
+/// the blob, the ref id it stopped on, and why.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ItemSectionStop {
     pub index: u8,
     pub offset: usize,
     pub ref_id: u32,
+    pub reason: ItemStopReason,
+}
+
+/// Why an item section stopped short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemStopReason {
+    /// The resolver could not classify the ref id, so the record's body width
+    /// is unknown. This is the case a resync can cross ([`recover_item_stop`]).
+    UnresolvableClass,
+    /// The header does not look like an item record at all
+    /// ([`item_header_plausible`]). On a first pass that means the stream
+    /// drifted; during a resync it is how a wrong skip width is caught.
+    ImplausibleHeader,
+}
+
+/// The largest `rent_type` [`RentInfo`] has a shape for. A bigger value is not
+/// "rent type 7", it is proof that the cursor is not on a record header.
+const MAX_RENT_TYPE: u32 = 3;
+
+/// Structural checks every real item record satisfies. Their job is to reject a
+/// *resync candidate* that merely happens to consume the blob: a wrong skip
+/// width puts the next header on neighbouring section bytes, and those read as
+/// absurd values.
+///
+/// Measured 2026-10-02 over every 0x3013 capture on this machine — 94 files,
+/// 545 frames, **1078 item sections, 15458 record headers**:
+///
+/// | check | violations |
+/// |---|---|
+/// | a slot number repeats inside one section | **0** of 1078 sections |
+/// | `slot >= size` | **0** of 15458 headers |
+/// | `rent_type > 3` | **0** of 15458 headers (every one was 0) |
+///
+/// Deliberately **not** a check: *"slots ascend"*. **71 of those 1078 sections
+/// break it** — the skrillax dialect writes the inventory in map order — so a
+/// parser that assumed it would reject real traffic. The convenient rule is the
+/// wrong one; these three are the ones the captures actually support.
+fn item_header_plausible(slot: u8, size: u8, rent_type: u32, slots_seen: &[u8]) -> bool {
+    rent_type <= MAX_RENT_TYPE && slot < size && !slots_seen.contains(&slot)
 }
 
 /// Diagnostic record of one item-record read attempt: where it started, its
@@ -749,12 +818,26 @@ pub fn parse_character_info(
 
     // A record of unresolvable width stops the forward pass where it stands,
     // which throws away every section behind it (#425: 710 of 1296 bytes).
-    // Try to resync across it — see `recover_item_stop`.
-    if let Some(stop) = info.item_stop {
-        if let Some(recovered) = recover_item_stop(raw, expected_unique_id, resolver, stop) {
-            return recovered;
+    // Try to resync across it — see `recover_item_stop`. A header that is not
+    // a plausible record at all is a drift, not a missing itemdata row, so
+    // there is no width to look for.
+    let mut ambiguity = None;
+    if let Some(stop) = info
+        .item_stop
+        .filter(|s| s.reason == ItemStopReason::UnresolvableClass)
+    {
+        match recover_item_stop(raw, expected_unique_id, resolver, stop) {
+            ItemResync::Recovered(recovered) => return *recovered,
+            ItemResync::Ambiguous(widths) => {
+                ambiguity = Some(ResyncAmbiguity {
+                    ref_id: stop.ref_id,
+                    widths,
+                });
+            }
+            ItemResync::Nothing => {}
         }
     }
+    info.resync_ambiguous = ambiguity.clone();
 
     // The forward tail is trusted when its position was plausible (checked
     // while parsing) and its unique id matches the known one, if any.
@@ -809,6 +892,7 @@ pub fn parse_character_info(
         forward_parsed_to: info.forward_parsed_to,
         item_trace: info.item_trace,
         item_stop: info.item_stop,
+        resync_ambiguous: ambiguity,
         ..Default::default()
     };
     if let Some((spawn, after_position)) = scan_character_data(raw, expected_unique_id) {
@@ -824,6 +908,7 @@ pub fn parse_character_info(
                     if let Ok(name) = read_string(&mut cursor) {
                         if name_plausible(&name) {
                             fallback.name = Some(name);
+                            read_anchored_tail_rest(raw, &mut cursor, &mut fallback);
                         }
                     }
                 }
@@ -831,6 +916,40 @@ pub fn parse_character_info(
         }
     }
     fallback
+}
+
+/// Continue the anchor-rebuilt tail past the name, through the job block and
+/// the account/session extras.
+///
+/// Why this exists: an item record of unknown width used to cost **everything**
+/// behind it. The anchor scan already salvaged position, movement, speeds and
+/// name, but `job` and `extras` were dropped even though they sit *behind* the
+/// anchor and need no knowledge of the item's width at all — and `extras` is
+/// where the transport the character is riding, its hotkey bar, its auto-potion
+/// settings and its job id live. Recovering them is the half of the repair that
+/// involves **no guessing whatsoever**, so it also covers the case where the
+/// width resync stays ambiguous.
+///
+/// The acceptance rule is the strongest one available here and it is cheap:
+/// both blocks must parse **and** land exactly on the blob's last byte. A tail
+/// read from the wrong offset practically never does, and a partial read is
+/// discarded rather than half-applied.
+fn read_anchored_tail_rest(
+    raw: &[u8],
+    cursor: &mut Cursor<&[u8]>,
+    fallback: &mut ParsedCharacterInfo,
+) {
+    let Ok(job) = JobInfo::read_from(cursor) else {
+        return;
+    };
+    let Ok(extras) = PlayerExtras::read_from(cursor) else {
+        return;
+    };
+    if cursor.position() as usize != raw.len() {
+        return;
+    }
+    fallback.job = Some(job);
+    fallback.extras = Some(extras);
 }
 
 /// The anchor-continued tail has no id to validate against, so gate the state
@@ -844,11 +963,20 @@ fn name_plausible(name: &str) -> bool {
     !name.is_empty() && name.len() <= 64 && !name.chars().any(|c| c.is_control())
 }
 
-/// Widest body a resync will attribute to an unresolvable record. The search
-/// is bounded only for cost — every candidate is validated against the whole
-/// blob, so the bound decides how big a record we can recover, never whether a
-/// recovery is correct. 64 bytes covers every body go-sro's
-/// `WriteInventoryItem` writes short of a magic-param-laden equipment record.
+/// Widest body a resync will attribute to an unresolvable record. 64 bytes
+/// covers every body go-sro's `WriteInventoryItem` writes short of a
+/// magic-param-laden equipment record.
+///
+/// CORRECTED 2026-10-02. This comment used to claim the bound "decides how big
+/// a record we can recover, never whether a recovery is correct". **That is
+/// false**, and it cost a live character its packet tail: on the real
+/// starter-kit blob (639 bytes, ref 46551) the widths that consume the whole
+/// body are `2, 29, 35, 41, 47, 53, 59` — so at a bound of 28 the true width 2
+/// is unique and the resync *succeeds*, while at 64 six decoys join it, the
+/// uniqueness rule refuses, and 189 bytes are discarded. The bound therefore
+/// decides the outcome. Lowering it would be luck, not a reason, so the bound
+/// stays and the decoys are rejected on structural grounds instead — see
+/// [`item_header_plausible`].
 const MAX_RECOVERED_BODY: usize = 64;
 
 /// Skip instruction for the one record whose class could not be resolved:
@@ -861,23 +989,58 @@ struct UnknownBody {
     body_len: usize,
 }
 
+/// Outcome of the resync across a record whose width we cannot derive.
+#[derive(Debug)]
+enum ItemResync {
+    /// Exactly one width explained the whole blob.
+    Recovered(Box<ParsedCharacterInfo>),
+    /// Several widths explained it. We refuse to pick one — but the fact must
+    /// be *visible*, not silent, so the widths travel to the caller and into
+    /// the log. The tail is then rebuilt by the anchor fallback.
+    Ambiguous(Vec<usize>),
+    /// No width explained the blob.
+    Nothing,
+}
+
 /// Resync across a record whose width we cannot derive.
 ///
 /// Idea: we cannot classify the ref id (the server's item table has rows the
 /// client's itemdata does not — live refs 46551 and 23273), but we can *test*
 /// a width: assume the body is `n` bytes, replay the whole forward pass, and
 /// keep `n` only if every following section then parses and the pass consumes
-/// the blob to the last byte with the expected unique id in the tail. A wrong
-/// `n` shifts every later record, so it practically never survives that. The
-/// width is accepted only when it is the unique one that does — an ambiguous
-/// blob keeps today's stop-and-report behaviour rather than guessing.
+/// the blob to the last byte with the expected unique id in the tail.
+///
+/// CORRECTED 2026-10-02. This comment used to add "a wrong `n` shifts every
+/// later record, so it practically never survives that". **Measured false** on
+/// the very blob the module doc already describes (the 46551 starter kit):
+/// *seven* widths consume it whole. Three reasons, all structural:
+///
+/// 1. the unresolvable record is the *second to last* of its section, so a too
+///    wide skip does not shift "every later record" — it eats one record and
+///    then lands past the list;
+/// 2. the mastery/skill lists are `break` lists, and the derive's loop ignores
+///    any tag byte that is neither `1` nor `2`. Such a list **re-finds itself**
+///    after a shift: it merely loses entries and then meets the `2` again
+///    (measured: width 2 yields all 7 masteries, width 29 five, width 59 none —
+///    and all three still end on the blob's last byte);
+/// 3. the drift is absorbed *before* the tail, so "the unique id in the tail
+///    matches" is identical in all seven readings. The test meant to tell the
+///    candidates apart cannot see them.
+///
+/// So the end-to-end replay is kept, but it is no longer the only filter: every
+/// record a candidate reads must also look like a record
+/// ([`item_header_plausible`]). On the live blob that leaves exactly one width
+/// (2 — a `stack: u16`, which is precisely what [`ItemTypeData::Unknown`]'s doc
+/// comment recorded on 2026-08-11). When it does *not*, the result is
+/// [`ItemResync::Ambiguous`] and the caller says so out loud.
 fn recover_item_stop(
     raw: &[u8],
     expected_unique_id: Option<u32>,
     resolver: &impl ItemClassResolver,
     stop: ItemSectionStop,
-) -> Option<ParsedCharacterInfo> {
-    let mut found: Option<ParsedCharacterInfo> = None;
+) -> ItemResync {
+    let mut found: Option<Box<ParsedCharacterInfo>> = None;
+    let mut widths: Vec<usize> = Vec::new();
     for body_len in 0..=MAX_RECOVERED_BODY.min(raw.len().saturating_sub(stop.offset)) {
         let mut candidate = ParsedCharacterInfo::default();
         let mut cursor = Cursor::new(raw);
@@ -900,19 +1063,24 @@ fn recover_item_stop(
         {
             continue;
         }
-        if found.is_some() {
-            // Two widths both explain the whole blob: we cannot tell them
-            // apart, so recover nothing.
-            return None;
+        widths.push(body_len);
+        if widths.len() > 1 {
+            // Keep scanning: naming *which* widths collided is what makes an
+            // ambiguity reviewable instead of a shrug.
+            continue;
         }
         candidate.fully_parsed = true;
         candidate.recovered_body = Some(RecoveredItemBody {
             ref_id: stop.ref_id,
             body_len,
         });
-        found = Some(candidate);
+        found = Some(Box::new(candidate));
     }
-    found
+    match (widths.len(), found) {
+        (1, Some(candidate)) => ItemResync::Recovered(candidate),
+        (0, _) => ItemResync::Nothing,
+        _ => ItemResync::Ambiguous(widths),
+    }
 }
 
 /// Run the staged forward pass, filling `info` section by section. Stops at
@@ -1026,6 +1194,7 @@ fn read_item_section(
         items: Vec::with_capacity(count as usize),
         stopped_at: None,
     };
+    let mut slots_seen: Vec<u8> = Vec::with_capacity(count as usize);
     for index in 0..count {
         let start_offset = cursor.position() as usize;
         let slot = u8::read_from(cursor)?;
@@ -1040,6 +1209,20 @@ fn read_item_section(
             ref_id,
             class,
         });
+        // The header must look like a record before its body is believed. A
+        // resync that skipped too far lands here on section bytes that are not
+        // a record at all — this is what tells those candidates apart from the
+        // true width (see `item_header_plausible` for the measured basis).
+        if !item_header_plausible(slot, size, rent.rent_type, &slots_seen) {
+            section.stopped_at = Some(ItemSectionStop {
+                index,
+                offset: start_offset,
+                ref_id,
+                reason: ItemStopReason::ImplausibleHeader,
+            });
+            return Ok(section);
+        }
+        slots_seen.push(slot);
         // A resync attempt supplies the width of the one record whose class
         // could not be resolved; everything else routes normally.
         let resync =
@@ -1064,6 +1247,7 @@ fn read_item_section(
                     index,
                     offset: start_offset,
                     ref_id,
+                    reason: ItemStopReason::UnresolvableClass,
                 });
                 return Ok(section);
             }
@@ -2162,5 +2346,403 @@ mod test {
         assert_eq!(extras.auto_mp, 45);
         assert_eq!(extras.auto_universal, 30);
         assert_eq!(extras.auto_potion_delay, 4);
+    }
+
+    // --- #455 follow-up: an unresolvable record must not cost the packet -----
+    //
+    // Live incident 2026-10-02 (testserver 178.63.157.114, fresh character
+    // "Kapitel9"): `CHARACTER_DATA parsed ... fully_parsed=false
+    // (450/639 bytes)` — 189 bytes thrown away on the starter-kit ref 46551,
+    // even though `live_fresh_char_unresolvable_starter_item_is_resynced`
+    // above was green the whole time.
+    //
+    // Why that test could not see it: its `MockResolver` holds ~18 refs; the
+    // real client holds **12061 itemdata rows** (the client's own boot log
+    // says so). The six decoy widths below only exist because the real table
+    // resolves ref **1** — `ITEM_ETC_GOLD_01`, TIDs 3/3/5/0, i.e. a
+    // `stack: u16` — so a wrong skip can read a pile of gold out of the
+    // mastery list and still finish the blob. A fixture resolver that is two
+    // orders of magnitude smaller than the system's cannot produce that, so
+    // these tests resolve every ref the blob touches, ref 1 included.
+
+    /// A real 639-byte `0x3013` from `packet_dump/admin8/0x3013.log`
+    /// (2026-08-22T10:37:06.506Z). It is the incident's packet: all 18 record
+    /// headers match the live log's item trace offset for offset (62, 89, …,
+    /// 441; refs 287…24446, then 46551), and the live log's
+    /// `bytes from item[16] (@430)` hexdump sits at exactly offset 430 here.
+    /// Only server time, unique id, position and the name's last character
+    /// differ ("Kapitel7" vs "Kapitel9", both 8 bytes).
+    const STARTER_KIT_639_HEX: &str = "1ada511a730700002201010000000000000000000000000000000000000000a086010000000000000000c8000000c8000000\
+         010000000000000000006d1300000000001f01000000000000000000000030000000000100020001000000008b0100000000\
+         000000000000003000000000010002000200000000670100000000000000000000003000000000010002000300000000d301\
+         00000000000000000000003000000000010002000400000000af010000000000000000000000300000000001000200050000\
+         0000f70100000000000000000000003000000000010002000600000000470000000000000000000000003e00000000010002\
+         000700000000fb0000000000000000000000002e000000000100020009000000002b07000000000000000000000000000000\
+         00010002000a000000004f0700000000000000000000000000000000010002000b0000000007070000000000000000000000\
+         0000000000010002000c00000000070700000000000000000000000000000000010002000d00000000855f0000e8030e0000\
+         0000895f0000e8030f00000000815f000014001000000000805f0000140011000000007e5f000014001200000000d7b50000\
+         010013000000005d5f0000000000000000000000000000000001000200050000010101000000010201000000010301000000\
+         0111010000000112010000000113010000000114010000000200020100010000000000000000001ab60200a861cf3f6c44c3\
+         dd6cbde99d32435ebd0001005ebd0000000000008041000048420000c8420008004b61706974656c37000000010000000000\
+         00000000000000000000ff5700a004000000000800000001000000000000000000000100010000";
+
+    /// A real 382-byte `0x3013` without any unresolvable record
+    /// (`or-client-skrillax/packet_dump/0x3013.log`, 2026-09-21T14:57:10.451Z).
+    /// Its inventory slots arrive as 4, 5, 3, 0, 2, 1 — **unordered on
+    /// purpose**: it is the positive control *and* the proof that the new
+    /// header checks did not adopt the convenient "slots ascend" rule (71 of
+    /// 1078 captured sections break it).
+    const NO_UNKNOWN_382_HEX: &str = "0000000073070000460101000000000000000000000000e8030000000000000000000000000000000000c8000000c8000000\
+         010000000000000000002d060400000000f70100000000000000000000000100000000010002000500000000d30100000000\
+         000000000000000100000000010002000300000000af01000000000000000000000001000000000100020000000000001f01\
+         000000000000000000000001000000000100020002000000008b010000000000000000000000010000000001000200010000\
+         0000670100000000000000000000000100000000010002000500000101010000000102010000000103010000000111010000\
+         000112010000000113010000000114010000000201020000000000000000f6000000a86100da6c4400000000001840430000\
+         00010000000000000000008041000048420000c842000a005465737477616c6b657200000000000000000000000000000000\
+         000000ffd7008000000000000100000000000000000100010002000100010000";
+
+    /// Every ref the 639-byte blob touches, with the class the user's v1.188
+    /// itemdata gives it — plus ref 1 (gold), which is what makes the decoy
+    /// widths readable. 46551 is the one row the client does not have.
+    fn starter_kit_resolver() -> MockResolver {
+        let mut classes = HashMap::new();
+        for eq in [
+            287, 395, 359, 467, 431, 503, 71, 251, 1835, 1871, 1799, 24413,
+        ] {
+            classes.insert(eq, ItemClass::Equipment);
+        }
+        for (exp, tid3, tid4) in [
+            (1u32, 5u32, 0u32), // ITEM_ETC_GOLD_01 — the decoys' raw material
+            (24446, 13, 6),
+            (24448, 3, 1),
+            (24449, 3, 3),
+            (24453, 1, 1),
+            (24457, 1, 2),
+        ] {
+            classes.insert(exp, ItemClass::Expendable { tid3, tid4 });
+        }
+        MockResolver { classes }
+    }
+
+    const STARTER_KIT_UID: u32 = 177_690;
+
+    #[test]
+    fn live_639_starter_kit_resyncs_against_a_full_size_itemdata() {
+        // RED before this change: `failed_stage = Some("inventory")`,
+        // `forward_parsed_to = 450` of 639 — exactly the live log.
+        //
+        // The blob is explained by SEVEN widths (2, 29, 35, 41, 47, 53, 59) as
+        // long as the only filter is "consumes the blob + tail id matches", so
+        // the uniqueness rule refused and the packet lost its tail. The widths
+        // 29.. put the next record header inside the mastery list; a record
+        // header is now required to look like one, which leaves width 2 — the
+        // `stack: u16` this file's own `ItemTypeData::Unknown` doc recorded on
+        // 2026-08-11.
+        let raw = hex_bytes(STARTER_KIT_639_HEX);
+        assert_eq!(raw.len(), 639, "fixture is the live-sized frame");
+        let info = parse_character_info(&raw, Some(STARTER_KIT_UID), &starter_kit_resolver());
+
+        assert_eq!(info.failed_stage, None, "forward pass must not stop");
+        assert!(info.fully_parsed);
+        assert_eq!(info.forward_parsed_to, 639);
+        assert_eq!(info.item_stop, None);
+        assert_eq!(info.resync_ambiguous, None);
+        assert_eq!(
+            info.recovered_body,
+            Some(RecoveredItemBody {
+                ref_id: 46551,
+                body_len: 2,
+            })
+        );
+
+        // Everything that used to be behind the offender now arrives.
+        let items = info.inventory.expect("inventory");
+        assert_eq!(
+            items.len(),
+            19,
+            "17 were kept before; the last two were not"
+        );
+        assert_eq!(items[18].slot, 19);
+        assert_eq!(items[18].ref_id, 24413);
+        assert_eq!(info.avatar_items.as_deref().map(<[_]>::len), Some(0));
+        let masteries = info.masteries.expect("masteries");
+        assert_eq!(
+            masteries.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![257, 258, 259, 273, 274, 275, 276],
+        );
+        assert_eq!(info.completed_quests.as_deref(), Some(&[1u32][..]));
+        assert_eq!(info.name.as_deref(), Some("Kapitel7"));
+        assert!(info.job.is_some());
+        assert_eq!(info.extras.expect("extras").jid, 8);
+        let spawn = info.spawn.expect("spawn");
+        assert_eq!(spawn.unique_id, STARTER_KIT_UID);
+        assert_eq!(spawn.region, 25000);
+    }
+
+    #[test]
+    fn the_six_decoy_widths_are_not_plausible_item_records() {
+        // Independent of the parser: read the record header each decoy width
+        // would produce and show *why* it is rejected. This is the measurement
+        // the fix rests on, written down as an assertion.
+        //
+        // The record starts at 441, its header is 9 bytes, so a skip of
+        // `width` puts the next header at 450 + width.
+        let raw = hex_bytes(STARTER_KIT_639_HEX);
+        let size = raw[60]; // inventory capacity byte
+        let slots_already_used: Vec<u8> = (0..=18).collect();
+        for width in [29usize, 35, 41, 47, 53, 59] {
+            let at = 450 + width;
+            let slot = raw[at];
+            let rent_type = u32::from_le_bytes(raw[at + 1..at + 5].try_into().unwrap());
+            assert!(
+                !item_header_plausible(slot, size, rent_type, &slots_already_used),
+                "decoy width {width} must not read as a record (slot {slot}, rent_type {rent_type})",
+            );
+        }
+        // …and the true width does.
+        let at = 450 + 2;
+        let rent_type = u32::from_le_bytes(raw[at + 1..at + 5].try_into().unwrap());
+        assert!(item_header_plausible(
+            raw[at],
+            size,
+            rent_type,
+            &slots_already_used
+        ));
+    }
+
+    #[test]
+    fn a_blob_without_an_unresolvable_record_still_parses_whole() {
+        // Positive control. Without it the red test above could pass on a
+        // parser that simply never stops. Also the ordering proof: this
+        // capture's slots are 4, 5, 3, 0, 2, 1.
+        let raw = hex_bytes(NO_UNKNOWN_382_HEX);
+        assert_eq!(raw.len(), 382);
+        let mut classes = HashMap::new();
+        for eq in [287, 359, 395, 431, 467, 503] {
+            classes.insert(eq, ItemClass::Equipment);
+        }
+        let info = parse_character_info(&raw, Some(246), &MockResolver { classes });
+
+        assert_eq!(info.failed_stage, None);
+        assert!(info.fully_parsed);
+        assert_eq!(info.forward_parsed_to, 382);
+        assert_eq!(info.recovered_body, None, "nothing to resync here");
+        assert_eq!(info.resync_ambiguous, None);
+        assert_eq!(info.item_stop, None);
+        let items = info.inventory.expect("inventory");
+        assert_eq!(
+            items.iter().map(|i| i.slot).collect::<Vec<_>>(),
+            vec![4, 5, 3, 0, 2, 1],
+            "unordered slots are real traffic and must stay accepted",
+        );
+        assert_eq!(info.name.as_deref(), Some("Testwalker"));
+        assert!(info.extras.is_some());
+    }
+
+    #[test]
+    fn an_undecidable_item_width_still_delivers_the_whole_tail() {
+        // (B), the half that does not guess at all. Drop a SECOND ref from the
+        // resolver (24413, the record right behind the offender): the resync
+        // models one unknown record, so now no width can explain the blob and
+        // it recovers nothing — on purpose.
+        //
+        // What must NOT happen is what happened live: the packet ending at the
+        // offender. The tail sits behind the position anchor and needs no
+        // knowledge of the item's width, so spawn, movement, speeds, name,
+        // job AND extras all have to arrive. `job`/`extras` are the new part —
+        // before this change the fallback stopped after the name.
+        let raw = hex_bytes(STARTER_KIT_639_HEX);
+        let mut resolver = starter_kit_resolver();
+        resolver.classes.remove(&24413);
+        let info = parse_character_info(&raw, Some(STARTER_KIT_UID), &resolver);
+
+        assert_eq!(info.recovered_body, None);
+        assert_eq!(info.failed_stage, Some("inventory"));
+        assert!(!info.fully_parsed);
+        let spawn = info.spawn.expect("anchor spawn");
+        assert_eq!(spawn.unique_id, STARTER_KIT_UID);
+        assert_eq!(spawn.region, 25000);
+        assert!(info.movement.is_some(), "movement");
+        let state = info.state.expect("state");
+        assert_eq!(
+            (state.walk_speed, state.run_speed, state.hwan_speed),
+            (16.0, 50.0, 100.0)
+        );
+        assert_eq!(info.name.as_deref(), Some("Kapitel7"));
+        assert!(info.job.is_some(), "job block must survive the stop");
+        let extras = info.extras.expect("extras must survive the stop");
+        assert_eq!(extras.jid, 8);
+        // The items read before the offender are still kept (#455).
+        assert_eq!(info.inventory.as_deref().map(<[_]>::len), Some(17));
+    }
+
+    #[test]
+    fn an_ambiguous_resync_is_reported_and_the_tail_survives() {
+        // The case the structural checks cannot settle: the unresolvable record
+        // is the LAST of its section, so a wrong width produces no record
+        // header at all — it lands straight in the mastery list, which is a
+        // `break` list and re-finds its own terminator. Several widths then
+        // explain the blob and none can be told from the others.
+        //
+        // Required behaviour: recover nothing, SAY SO (the widths travel to the
+        // caller, which logs them at info level), and still deliver the tail.
+        const UNRESOLVABLE: u32 = 46551;
+        let b = stats_block(Body::default())
+            // inventory: one ordinary equipment record
+            .u8(10)
+            .u8(1)
+            .u8(0)
+            .u32(0)
+            .u32(SWORD)
+            .u8(0)
+            .u64(0)
+            .u32(48)
+            .u8(0)
+            .u8(1)
+            .u8(0)
+            .u8(2)
+            .u8(0)
+            // avatar inventory: the unresolvable record is its only entry, so
+            // nothing behind it is a record header
+            .u8(5)
+            .u8(1)
+            .u8(0)
+            .u32(0)
+            .u32(UNRESOLVABLE)
+            .u16(1) // the true body: a stack of 1
+            // mastery/skill section — the self-resyncing part
+            .u8(0)
+            .u8(1)
+            .u32(257)
+            .u8(0)
+            .u8(1)
+            .u32(258)
+            .u8(0)
+            .u8(2)
+            .u8(0)
+            .u8(2)
+            // quests + collection book
+            .u16(0)
+            .u8(0)
+            .u8(0)
+            .u32(0)
+            // tail
+            .u32(UNIQUE_ID)
+            .u16(0x61A8)
+            .f32(972.9)
+            .f32(-0.0)
+            .f32(190.1)
+            .u16(58594)
+            .u8(0)
+            .u8(1)
+            .u8(1)
+            .u16(0x2FEC)
+            .u8(0)
+            .u8(0)
+            .u8(0)
+            .u8(0)
+            .f32(16.0)
+            .f32(50.0)
+            .f32(100.0)
+            .u8(0)
+            .string("Kapitel9")
+            // job
+            .string("")
+            .u8(0)
+            .u8(0)
+            .u32(0)
+            .u32(0)
+            .u32(0)
+            // extras
+            .u8(0)
+            .u8(0)
+            .u8(0)
+            .u8(0)
+            .u64(0)
+            .u32(8)
+            .u8(1)
+            .u8(0)
+            .u8(0)
+            .u16(0)
+            .u16(0)
+            .u16(0)
+            .u8(0)
+            .u8(0)
+            .u32(0)
+            .u8(0);
+        let info = parse_character_info(&b.0, Some(UNIQUE_ID), &resolver());
+
+        assert_eq!(info.recovered_body, None, "must not pick one of several");
+        let amb = info
+            .resync_ambiguous
+            .expect("the collision must be reported");
+        assert_eq!(amb.ref_id, UNRESOLVABLE);
+        assert!(
+            amb.widths.len() > 1,
+            "ambiguity means more than one width: {:?}",
+            amb.widths,
+        );
+        assert!(
+            amb.widths.contains(&2),
+            "the true width is among them — we refused despite having it: {:?}",
+            amb.widths,
+        );
+        // …and the tail is there anyway.
+        assert_eq!(info.spawn.expect("anchor spawn").unique_id, UNIQUE_ID);
+        assert_eq!(info.name.as_deref(), Some("Kapitel9"));
+        assert!(info.job.is_some());
+        assert_eq!(info.extras.expect("extras").jid, 8);
+    }
+
+    #[test]
+    fn an_implausible_record_header_stops_the_section_and_keeps_what_was_read() {
+        // The header check must behave like the #455 stop, not like a crash:
+        // records already decoded survive, the offending one is named.
+        let b = Body::default()
+            .u8(45)
+            .u8(3)
+            .u8(6)
+            .u32(0)
+            .u32(PILLS)
+            .u16(7)
+            // slot 6 again — one slot cannot hold two items
+            .u8(6)
+            .u32(0)
+            .u32(PILLS)
+            .u16(9)
+            .u8(8)
+            .u32(0)
+            .u32(PILLS)
+            .u16(11);
+        let mut cursor = Cursor::new(b.0.as_slice());
+        let mut trace = Vec::new();
+        let section =
+            read_item_section(&mut cursor, &resolver(), &mut trace, None).expect("section");
+        assert_eq!(section.items.len(), 1);
+        let stop = section.stopped_at.expect("stopped");
+        assert_eq!(stop.index, 1);
+        assert_eq!(stop.reason, ItemStopReason::ImplausibleHeader);
+
+        // The same shape with a rent type no RentInfo arm knows.
+        let b = Body::default()
+            .u8(45)
+            .u8(2)
+            .u8(6)
+            .u32(0)
+            .u32(PILLS)
+            .u16(7)
+            .u8(9)
+            .u32(0x0101_0100)
+            .u32(PILLS)
+            .u16(9);
+        let mut cursor = Cursor::new(b.0.as_slice());
+        let mut trace = Vec::new();
+        let section =
+            read_item_section(&mut cursor, &resolver(), &mut trace, None).expect("section");
+        assert_eq!(section.items.len(), 1);
+        assert_eq!(
+            section.stopped_at.expect("stopped").reason,
+            ItemStopReason::ImplausibleHeader
+        );
     }
 }

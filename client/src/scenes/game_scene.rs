@@ -958,6 +958,21 @@ fn apply_pending_character_data(
             rec.ref_id, rec.body_len,
         );
     }
+    if let Some(amb) = parsed.resync_ambiguous.as_ref() {
+        // Several skip widths each consume the whole blob, so the resync
+        // refuses to pick one. `info!`, not `debug!`: an undecidable width is
+        // the difference between a complete record and a salvaged one, and a
+        // guess hidden at debug level is how this cost 189 bytes unnoticed.
+        // The tail below is rebuilt from the anchor, so the packet is not lost.
+        info!(
+            "network: CHARACTER_DATA resync for unresolvable item ref_id={} is \
+             AMBIGUOUS — {} widths explain the whole blob ({:?}); not guessing, \
+             rebuilding the tail from the position anchor instead",
+            amb.ref_id,
+            amb.widths.len(),
+            amb.widths,
+        );
+    }
     if let Some(stage) = parsed.failed_stage {
         // A layout drift: log where the forward pass stopped so a live capture
         // can pin it (the anchor fallback already salvaged position/speeds).
@@ -972,11 +987,12 @@ fn apply_pending_character_data(
             // A short read, not a corrupt stream: the records before the stop
             // are kept (#455). Say how many survived and what stopped us.
             warn!(
-                "network:   item section stopped at record {} (@{}, ref_id={}, {} bytes left); \
-                 keeping the {} item(s) read before it",
+                "network:   item section stopped at record {} (@{}, ref_id={}, reason {:?}, \
+                 {} bytes left); keeping the {} item(s) read before it",
                 stop.index,
                 stop.offset,
                 stop.ref_id,
+                stop.reason,
                 raw.len().saturating_sub(parsed.forward_parsed_to),
                 parsed.inventory.as_ref().map(|i| i.len()).unwrap_or(0),
             );
