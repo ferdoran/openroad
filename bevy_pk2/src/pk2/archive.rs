@@ -103,32 +103,39 @@ impl Archive {
 }
 
 impl Archive {
-    /// Convenience wrapper over [`Archive::open`] for the startup paths, where
-    /// a missing or corrupt PK2 is genuinely fatal (the client cannot run
-    /// without its assets). Anything that wants to handle the failure should
-    /// call [`Archive::open`] instead.
+    /// Open an archive the caller can survive without: the failure is reported
+    /// in one readable line and `None` comes back.
     ///
-    /// This replaces the old `From<P>` conversion, which could not carry the
-    /// key now that one is required.
-    pub fn open_or_panic<P: AsRef<Path>>(path: P, key: &Pk2Key) -> Self {
+    /// A client that is handed a data
+    /// folder with only some of the archives in it should say which archive is
+    /// missing and run with what it has: a panic here happens before the window
+    /// exists, so the user would only see a backtrace naming an `unwrap`.
+    pub fn open_or_report<P: AsRef<Path>>(path: P, key: &Pk2Key) -> Option<Self> {
         let path = path.as_ref();
-        Archive::open(path, key).unwrap_or_else(|e| {
-            error!("failed to open archive {}: {:?}", path.display(), e);
-            panic!("failed to open archive {}: {:?}", path.display(), e)
-        })
+        match Archive::open(path, key) {
+            Ok(archive) => Some(archive),
+            Err(err) => {
+                // Both channels on purpose: this runs during plugin build, so
+                // the tracing subscriber may not be installed yet.
+                eprintln!("archive {} unavailable - {err}", path.display());
+                error!("archive {} unavailable - {}", path.display(), err);
+                None
+            }
+        }
     }
 
-    /// Open one archive with the key resolved from the user's own environment
-    /// or `config.yaml` ([`Pk2Key::resolve`]).
+    /// Open one archive with the key resolved from the environment or
+    /// `config.yaml` ([`Pk2Key::resolve`]).
     ///
-    /// For the one-off callers — tools and tests — that open a single archive
-    /// and have no reason to thread a key around. A startup path opening
-    /// several archives should resolve the key once and use
-    /// [`Archive::open_or_panic`] instead, so a misconfigured key is reported
-    /// once rather than five times.
+    /// For the one-off callers — command-line tools and tests — that open a
+    /// single named archive and cannot do anything at all without it, so an
+    /// absent archive is a usage error. Anything long-running (the client)
+    /// uses [`Archive::open_or_report`] or [`Archive::open`].
     pub fn configured<P: AsRef<Path>>(path: P) -> Self {
+        let path = path.as_ref();
         let key = Pk2Key::resolve().unwrap_or_else(|err| panic!("{err}"));
-        Archive::open_or_panic(path, &key)
+        Archive::open(path, &key)
+            .unwrap_or_else(|err| panic!("archive {} unavailable - {err}", path.display()))
     }
 }
 
@@ -278,5 +285,29 @@ impl Archive {
         self.entries.iter().for_each(|(k, _v)| {
             info!("Entry: {}", k.display());
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (d) A data folder missing one archive must be reportable, not fatal.
+    /// An `unwrap` here dies before the window exists, so a user with only some
+    /// of the archives would see a backtrace.
+    #[test]
+    fn a_missing_archive_is_an_error_not_a_panic() {
+        let key = Pk2Key::from_config("testkey", "00112233445566778899").unwrap();
+        let missing = std::env::temp_dir().join("openroad-no-such-archive.pk2");
+        let Err(err) = Archive::open(&missing, &key) else {
+            panic!("a missing file cannot open");
+        };
+        assert!(matches!(err, Error::IO(_)), "want IO error, got {err:?}");
+        // and the message a user gets is a sentence, not a Debug dump
+        assert_eq!(err.to_string(), "file not found");
+        assert!(
+            Archive::open_or_report(&missing, &key).is_none(),
+            "reporting open yields None instead of unwinding"
+        );
     }
 }

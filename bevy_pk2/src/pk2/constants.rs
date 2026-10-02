@@ -15,3 +15,12 @@ pub const ENTRIES_PER_BLOCK: usize = BLOCK_SIZE / ENTRY_SIZE;
 /// archives' longest chain is far below this; it exists so a hostile or
 /// corrupt `next_chain` cannot spin forever even when every offset is unique.
 pub const MAX_CHAIN_BLOCKS: usize = 4096;
+/// Hard cap on how many DIRECTORIES one archive's tree may contain (see
+/// `directory.rs`). It must NOT be [`MAX_CHAIN_BLOCKS`]: a per-chain limit used
+/// as a per-archive directory count rejects valid archives — one archive
+/// carries 2469 directories (below 4096) versus 5361 in another (above 4096,
+/// which then fails with a bogus chain-loop error). 65536 is over 12x the
+/// largest count observed while
+/// still bounding the walk — one directory costs at least one block read, so
+/// the work stays linear and finite even for a hostile archive.
+pub const MAX_DIRECTORIES: usize = 65_536;
