@@ -53,7 +53,7 @@ use bevy::render::mesh::RenderMesh;
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_phase::*;
 use bevy::render::render_resource::*;
-use bevy::render::sync_world::MainEntityHashMap;
+use bevy::render::sync_world::{MainEntityHashMap, MainEntityHashSet};
 use bevy::render::view::{ExtractedView, RenderShadowMapVisibleEntities, RetainedViewEntity};
 
 use super::{RenderTerrainGroundTextures, TerrainPipeline};
@@ -265,6 +265,8 @@ pub(super) fn specialize_terrain_shadows(
 pub(super) fn queue_terrain_shadows(
     draw_functions: Res<DrawFunctions<Shadow>>,
     mut shadow_phases: ResMut<ViewBinnedRenderPhases<Shadow>>,
+    mut queued: ResMut<super::QueuedTerrain<Shadow>>,
+    mut added: Local<MainEntityHashSet>,
     cache: Res<SpecializedTerrainShadowPipelineCache>,
     render_mesh_instances: Res<RenderMeshInstances>,
     mesh_allocator: Res<MeshAllocator>,
@@ -281,62 +283,71 @@ pub(super) fn queue_terrain_shadows(
         let Some(phase) = shadow_phases.get_mut(&extracted_view.retained_view_entity) else {
             continue;
         };
-        let Some(view_cache) = cache.0.get(&extracted_view.retained_view_entity) else {
-            continue;
-        };
-        let Ok(shadow_map_visible_entities) = shadow_map_visible_entities.get(*light_entity) else {
-            continue;
-        };
-        let Some(visible_entities) = shadow_map_visible_entities
-            .subviews
-            .get(&extracted_view.retained_view_entity)
-        else {
-            continue;
-        };
-        let Some(mesh_entities) = visible_entities.get::<Mesh3d>() else {
-            continue;
-        };
-        for (render_entity, main_entity) in mesh_entities.iter_visible() {
-            if !ground_textures.0.contains_key(main_entity) {
-                continue;
-            }
-            let Some(pipeline_id) = view_cache.get(main_entity).copied() else {
-                continue;
+        added.clear();
+        'collect: {
+            let Some(view_cache) = cache.0.get(&extracted_view.retained_view_entity) else {
+                break 'collect;
             };
-            let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(*main_entity)
+            let Ok(shadow_map_visible_entities) = shadow_map_visible_entities.get(*light_entity)
             else {
-                continue;
+                break 'collect;
             };
-            if !mesh_instance
-                .flags()
-                .contains(RenderMeshInstanceFlags::SHADOW_CASTER)
-            {
-                continue;
+            let Some(visible_entities) = shadow_map_visible_entities
+                .subviews
+                .get(&extracted_view.retained_view_entity)
+            else {
+                break 'collect;
+            };
+            let Some(mesh_entities) = visible_entities.get::<Mesh3d>() else {
+                break 'collect;
+            };
+            for (render_entity, main_entity) in mesh_entities.iter_visible() {
+                if !ground_textures.0.contains_key(main_entity) {
+                    continue;
+                }
+                let Some(pipeline_id) = view_cache.get(main_entity).copied() else {
+                    continue;
+                };
+                let Some(mesh_instance) =
+                    render_mesh_instances.render_mesh_queue_data(*main_entity)
+                else {
+                    continue;
+                };
+                if !mesh_instance
+                    .flags()
+                    .contains(RenderMeshInstanceFlags::SHADOW_CASTER)
+                {
+                    continue;
+                }
+                let Some(slabs) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id()) else {
+                    continue;
+                };
+                added.insert(*main_entity);
+                queued.add(
+                    extracted_view.retained_view_entity,
+                    phase,
+                    ShadowBatchSetKey {
+                        pipeline: pipeline_id,
+                        draw_function,
+                        // No per-region data in this draw at all (unlike the opaque
+                        // pass) — safe to leave `None`, exactly like Bevy's own stock
+                        // depth-only shadow draws. See the module doc.
+                        material_bind_group_index: None,
+                        slabs,
+                    },
+                    ShadowBinKey {
+                        asset_id: mesh_instance.mesh_asset_id().into(),
+                    },
+                    (*render_entity, *main_entity),
+                    mesh_instance.current_uniform_index,
+                    BinnedRenderPhaseType::mesh(
+                        mesh_instance.should_batch(),
+                        &gpu_preprocessing_support,
+                    ),
+                );
             }
-            let Some(slabs) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id()) else {
-                continue;
-            };
-            phase.add(
-                ShadowBatchSetKey {
-                    pipeline: pipeline_id,
-                    draw_function,
-                    // No per-region data in this draw at all (unlike the opaque
-                    // pass) — safe to leave `None`, exactly like Bevy's own stock
-                    // depth-only shadow draws. See the module doc.
-                    material_bind_group_index: None,
-                    slabs,
-                },
-                ShadowBinKey {
-                    asset_id: mesh_instance.mesh_asset_id().into(),
-                },
-                (*render_entity, *main_entity),
-                mesh_instance.current_uniform_index,
-                BinnedRenderPhaseType::mesh(
-                    mesh_instance.should_batch(),
-                    &gpu_preprocessing_support,
-                ),
-            );
         }
+        queued.sweep(extracted_view.retained_view_entity, phase, &added);
     }
 }
 

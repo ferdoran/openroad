@@ -53,7 +53,7 @@ use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_phase::*;
 use bevy::render::render_resource::*;
 use bevy::render::renderer::RenderDevice;
-use bevy::render::sync_world::{MainEntity, MainEntityHashMap};
+use bevy::render::sync_world::{MainEntity, MainEntityHashMap, MainEntityHashSet};
 use bevy::render::texture::{FallbackImage, GpuImage};
 use bevy::render::view::{ExtractedView, RenderVisibleEntities, RetainedViewEntity};
 use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems};
@@ -80,6 +80,8 @@ impl Plugin for TerrainRenderPipelinePlugin {
             .init_resource::<RenderTerrainGroundTextures>()
             .init_resource::<SpecializedMeshPipelines<TerrainPipeline>>()
             .init_resource::<SpecializedTerrainPipelineCache>()
+            .init_resource::<QueuedTerrain<Opaque3d>>()
+            .init_resource::<QueuedTerrain<Shadow>>()
             .init_resource::<TerrainRegionBindGroups>()
             .init_resource::<TerrainGlobalBindGroup>()
             .init_resource::<SpecializedMeshPipelines<TerrainShadowPipeline>>()
@@ -562,9 +564,84 @@ fn specialize_terrain(
     }
 }
 
+/// What each view's binned phase currently holds for terrain, per entity.
+///
+/// Bevy 0.19's binned phases are *retained* across frames, and `add` files an
+/// entity under its new (batch set, bin) without taking it out of the old one.
+/// Re-queuing every visible entity each frame therefore left an entity whose
+/// key changed — a new pipeline after any view-key change (a depth prepass,
+/// MSAA, an environment map), new mesh slabs — drawn *twice*, once with the
+/// stale pipeline, whose view bind-group layout no longer matches: a wgpu
+/// validation error that quits the app. Entities that left the view stayed
+/// binned too. Bevy's own material queue avoids both with `remove`; so does
+/// this, keyed on what was actually added.
+#[derive(Resource)]
+pub(crate) struct QueuedTerrain<P: BinnedPhaseItem>(
+    HashMap<RetainedViewEntity, MainEntityHashMap<(P::BatchSetKey, P::BinKey)>>,
+);
+
+impl<P: BinnedPhaseItem> Default for QueuedTerrain<P> {
+    fn default() -> Self {
+        Self(HashMap::new())
+    }
+}
+
+impl<P: BinnedPhaseItem> QueuedTerrain<P> {
+    /// Adds `main_entity` to `phase`, first taking it out of the bin it was
+    /// filed under if its keys changed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add(
+        &mut self,
+        view: RetainedViewEntity,
+        phase: &mut BinnedRenderPhase<P>,
+        batch_set_key: P::BatchSetKey,
+        bin_key: P::BinKey,
+        entities: (Entity, MainEntity),
+        input_uniform_index: InputUniformIndex,
+        phase_type: BinnedRenderPhaseType,
+    ) {
+        let keys = (batch_set_key.clone(), bin_key.clone());
+        let queued = self.0.entry(view).or_default();
+        if queued
+            .insert(entities.1, keys.clone())
+            .is_some_and(|old| old != keys)
+        {
+            phase.remove(entities.1);
+        }
+        phase.add(
+            batch_set_key,
+            bin_key,
+            entities,
+            input_uniform_index,
+            phase_type,
+        );
+    }
+
+    /// Removes every entity of `view` that was not added this frame.
+    pub(crate) fn sweep(
+        &mut self,
+        view: RetainedViewEntity,
+        phase: &mut BinnedRenderPhase<P>,
+        added: &MainEntityHashSet,
+    ) {
+        if let Some(queued) = self.0.get_mut(&view) {
+            queued.retain(|entity, _| {
+                let keep = added.contains(entity);
+                if !keep {
+                    phase.remove(*entity);
+                }
+                keep
+            });
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn queue_terrain_opaque(
     draw_functions: Res<DrawFunctions<Opaque3d>>,
     mut opaque_phases: ResMut<ViewBinnedRenderPhases<Opaque3d>>,
+    mut queued: ResMut<QueuedTerrain<Opaque3d>>,
+    mut added: Local<MainEntityHashSet>,
     cache: Res<SpecializedTerrainPipelineCache>,
     render_mesh_instances: Res<RenderMeshInstances>,
     mesh_allocator: Res<MeshAllocator>,
@@ -577,17 +654,18 @@ fn queue_terrain_opaque(
         let Some(phase) = opaque_phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
-        let Some(view_cache) = cache.0.get(&view.retained_view_entity) else {
-            continue;
-        };
-        let Some(mesh_entities) = visible_entities.get::<Mesh3d>() else {
-            continue;
-        };
-        for (render_entity, main_entity) in mesh_entities.iter_visible() {
+        added.clear();
+        let view_cache = cache.0.get(&view.retained_view_entity);
+        let mesh_entities = visible_entities.get::<Mesh3d>();
+        for (render_entity, main_entity) in mesh_entities
+            .filter(|_| view_cache.is_some())
+            .into_iter()
+            .flat_map(|entities| entities.iter_visible())
+        {
             if !ground_textures.0.contains_key(main_entity) {
                 continue;
             }
-            let Some(pipeline_id) = view_cache.get(main_entity).copied() else {
+            let Some(pipeline_id) = view_cache.and_then(|c| c.get(main_entity)).copied() else {
                 continue;
             };
             let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(*main_entity)
@@ -597,7 +675,10 @@ fn queue_terrain_opaque(
             let Some(slabs) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id()) else {
                 continue;
             };
-            phase.add(
+            added.insert(*main_entity);
+            queued.add(
+                view.retained_view_entity,
+                phase,
                 Opaque3dBatchSetKey {
                     pipeline: pipeline_id,
                     draw_function,
@@ -620,5 +701,6 @@ fn queue_terrain_opaque(
                 ),
             );
         }
+        queued.sweep(view.retained_view_entity, phase, &added);
     }
 }
