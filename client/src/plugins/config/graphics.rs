@@ -61,6 +61,13 @@ pub struct GraphicsSettings {
     pub render_scale: RenderScale,
     #[serde(default)]
     pub tonemapping: TonemappingConfig,
+    /// Depth-only prepass on the window cameras, so the main pass shades each
+    /// pixel once: early-Z then rejects every hidden fragment before its
+    /// material runs. Facing the Jangan West waterfall the opaque pass shaded
+    /// ~10M fragments for a 2M-pixel screen (map objects stacked behind each
+    /// other, drawn in no particular depth order) — ~3.5 ms of GPU time.
+    #[serde(default)]
+    pub depth_prepass: bool,
 }
 
 /// Which water shader the streamed water planes use.
