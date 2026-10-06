@@ -25,6 +25,7 @@ pub mod action;
 pub mod alchemy;
 pub mod appearance_change;
 pub mod arena;
+pub mod art;
 pub mod autopotion;
 pub mod cast_gauge;
 pub mod character_info;
@@ -300,7 +301,12 @@ mod test {
         // because the low-vitals overlays are authored TWICE at different sheet
         // sizes (the mini-info's 512x64 pair and the quick-party board's
         // 256x64 pair), so the tile arithmetic cannot be a constant in either.
-        const HELPERS: [&str; 8] = [
+        // `art` is the one conversion from a descriptor's CP949 Windows art
+        // path to our asset id. Three windows carried a copy of it and all
+        // three were wrong for 955 of the 957 shipped paths; one function with
+        // corpus-fed tests replaces them. Pure, no systems, no state.
+        const HELPERS: [&str; 9] = [
+            "art",
             "game_window",
             "modal_dialog",
             "world_anchor",

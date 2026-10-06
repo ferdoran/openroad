@@ -40,6 +40,7 @@
 //!   (doc §9); picking a team raises [`RequestFreePvpTeam`] and nothing else
 //!   consumes it yet. Inventing a packet would be inventing the wire.
 
+use crate::plugins::hud::art::art_path;
 use bevy::prelude::*;
 use bevy::ui::UiTargetCamera;
 use bevy::ui_widgets::{Activate, Button};
@@ -56,7 +57,6 @@ use crate::scenes::SceneState;
 /// `res_ui\<file>.2dt` literal).
 const DESCRIPTOR: &str = "media://res_ui/frpvp.2dt";
 /// Where the descriptor's `Background` paths are rooted.
-const ART_ROOT: &str = "media://interface/";
 const CAPTION_FONT: f32 = 9.0;
 
 /// One of the four Free-PvP teams, plus the yellow free-for-all state.
@@ -181,17 +181,6 @@ struct FreePvpRow(FreePvpTeam);
 
 #[derive(Component)]
 struct FreePvpCollapse;
-
-/// `frpvp\frpvp_red.ddj` -> `media://interface/frpvp/frpvp_red.ddj`.
-///
-/// Descriptor art paths are CP949 Windows paths relative to `Media/interface`;
-/// our asset paths are lowercase and forward-slashed.
-fn art_path(background: &str) -> String {
-    format!(
-        "{ART_ROOT}{}",
-        background.to_ascii_lowercase().replace('\\', "/")
-    )
-}
 
 /// The rows of a `frpvp.2dt`-shaped descriptor, top to bottom.
 ///
@@ -508,18 +497,6 @@ mod test {
         assert_eq!(FreePvpTeam::from_art("frpvp\\frpvp_frame01.ddj"), None);
         assert_eq!(FreePvpTeam::from_art("frpvp\\frpvp_button.ddj"), None);
         assert_eq!(FreePvpTeam::from_art(""), None);
-    }
-
-    #[test]
-    fn art_paths_are_media_relative_and_forward_slashed() {
-        assert_eq!(
-            art_path("frpvp\\frpvp_frame02.ddj"),
-            "media://interface/frpvp/frpvp_frame02.ddj"
-        );
-        assert_eq!(
-            art_path("ifcommon\\com_m_button02.ddj"),
-            "media://interface/ifcommon/com_m_button02.ddj"
-        );
     }
 
     /// Every state has its own icon and its own string; nothing shares.
