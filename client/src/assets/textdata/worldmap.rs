@@ -372,6 +372,9 @@ impl WorldMapTable {
             }
             let kind = match fields[2] {
                 "1" => PoiKind::Label(fields[3].to_string()),
+                // Icon rows without a texture path exist in the data; keeping
+                // them would queue an asset load for an empty path.
+                "2" if fields[3].is_empty() => continue,
                 "2" => PoiKind::Icon(fields[3].replace('\\', "/")),
                 _ => continue,
             };
@@ -417,6 +420,16 @@ mod test {
 
     const LOCALINFO: &str = "1\t11001\t1\tSN_ZONE_11001\tJ\tSmith\tlocal\t0\t1\t-1\t-1\t413\t459\t0\t0\t255\t255\t255\t0\t0\t1\txxx\n\
         1\t91001\t2\tinterface\\worldmap\\map\\city_jangan.ddj\tCH\tJangan\tworld\t1\t0\t167\t98\t16\t2\t64\t64\t0\t0\t0\t0\t0\t1\txxx\n";
+
+    // Verbatim row from the shipped table: kind 2, no texture path.
+    const LOCALINFO_EMPTY_ICON: &str =
+        "1\t91517\t2\t\t왕가의 계곡\t특산품 상인 카엘라\t월드맵\t\t0\t\t\t\t\t\t\t\t\t\t\t\t\tSN_NPC_SD_M_AREA_SPECIAL2\n";
+
+    #[test]
+    fn skips_icon_rows_without_a_texture_path() {
+        let table = WorldMapTable::parse(MAPINFO, LOCALINFO_EMPTY_ICON);
+        assert!(table.pois.is_empty());
+    }
 
     #[test]
     fn parses_maps_and_projects() {
