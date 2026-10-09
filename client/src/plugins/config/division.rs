@@ -14,7 +14,6 @@
 //! file falls back to [`DivisionInfo::FALLBACK_CONTENT_ID`] and leaves the
 //! gateway to `config.yaml`, so a tree without PK2s keeps working.
 
-use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
 use bevy::prelude::{warn, Resource};
@@ -72,23 +71,17 @@ impl DivisionInfo {
 
     fn load_from_pk2() -> Option<Self> {
         let media = media_pk2_path();
-        // `open_or_panic` panics rather than returning an error, and this runs
-        // before the asset plugin would have reported a missing archive.
         // A missing key is the same class of "no archive to read" as a missing
         // file here, so it takes the same silent fallback rather than aborting
         // startup — the asset plugin reports it properly a moment later.
         let key = Pk2Key::resolve().ok()?;
-        panic::catch_unwind(AssertUnwindSafe(|| {
-            let archive = Archive::open_or_panic(&media, &key);
-            let mut info = Self::parse(&archive.read_file_bytes(Path::new("divisioninfo.txt"))?)?;
-            info.gateway_port = archive
-                .read_file_bytes(Path::new("gateport.txt"))
-                .as_deref()
-                .and_then(parse_gateport);
-            Some(info)
-        }))
-        .ok()
-        .flatten()
+        let archive = Archive::open(&media, &key).ok()?;
+        let mut info = Self::parse(&archive.read_file_bytes(Path::new("divisioninfo.txt"))?)?;
+        info.gateway_port = archive
+            .read_file_bytes(Path::new("gateport.txt"))
+            .as_deref()
+            .and_then(parse_gateport);
+        Some(info)
     }
 
     /// Parses `divisioninfo.txt`:

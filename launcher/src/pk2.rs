@@ -2,9 +2,9 @@ use crate::utils::show_error;
 use bevy_pk2::prelude::{Archive, Pk2Key};
 use byteorder::{LittleEndian, ReadBytesExt};
 use ddsfile::{D3DFormat, Dds};
+use std::env;
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
-use std::{env, panic};
 
 pub fn dat_or_image(data: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     if data.len() >= 12 && &data[..7] == b"JMXVDDJ" {
@@ -157,18 +157,15 @@ pub fn read_pk2(file_path: &str) -> Result<Archive, String> {
     }
 
     // Resolved before the open so a missing key reports itself, rather than
-    // surfacing as a generic "failed to open" from the panic handler below.
+    // surfacing as a generic "failed to open" from the archive open below.
     let key = Pk2Key::resolve().map_err(|err| {
         let msg = err.to_string();
         show_error(&msg);
         msg
     })?;
 
-    let archive = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        Archive::open_or_panic(&abs_path, &key)
-    }))
-    .map_err(|_| {
-        let msg = format!("Failed to open {}", abs_path.display());
+    let archive = Archive::open(&abs_path, &key).map_err(|err| {
+        let msg = format!("Failed to open {} - {err}", abs_path.display());
         show_error(&msg);
         msg
     })?;

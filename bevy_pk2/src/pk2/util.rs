@@ -1,8 +1,12 @@
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 
+// only the in-memory twin below needs these
+#[cfg(test)]
 use bytes::Bytes;
+#[cfg(test)]
+use std::io::Cursor;
 
 use crate::pk2::blowfish::Blowfish;
 use crate::pk2::constants::{BLOCK_SIZE, ENTRIES_PER_BLOCK, ENTRY_SIZE, MAX_CHAIN_BLOCKS};
@@ -94,10 +98,15 @@ pub fn read_block(file: &mut File, offset: u64, blowfish: &Blowfish) -> Result<V
     Ok(entries)
 }
 
+/// The in-memory twin of [`read_block`], kept for the chain-guard tests that
+/// drive a buffer rather than a file. It is not part of the shipped reader:
+/// indexing an archive goes through the file-backed walk only.
+#[cfg(test)]
 pub trait CursorExt {
     fn read_block(&mut self, offset: u64, blowfish: &Blowfish) -> Result<Vec<Entry>, Error>;
 }
 
+#[cfg(test)]
 impl CursorExt for Cursor<Bytes> {
     /// Same bounded walk as [`read_block`], over an in-memory archive.
     fn read_block(&mut self, offset: u64, blowfish: &Blowfish) -> Result<Vec<Entry>, Error> {
