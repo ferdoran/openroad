@@ -38,6 +38,7 @@
 //!   wire's `Red = 0` / `Blue = 1`. Drawing a guessed crest would be a fidelity
 //!   claim we cannot make; the row still names and scores its player.
 
+use crate::plugins::hud::art::art_path;
 use bevy::prelude::*;
 use bevy::ui::UiTargetCamera;
 
@@ -52,7 +53,6 @@ use super::{ArenaRankRow, ArenaState};
 const RANK_DESCRIPTOR: &str = "media://res_ui/arena_game_rank.2dt";
 const SCORE_DESCRIPTOR: &str = "media://res_ui/arena_game_score.2dt";
 /// Where the descriptors' `Background` paths are rooted.
-const ART_ROOT: &str = "media://interface/";
 const ROW_FONT: f32 = 9.0;
 const SCORE_FONT: f32 = 12.0;
 
@@ -64,14 +64,6 @@ struct ArenaBoardDescriptors {
 
 #[derive(Component)]
 pub struct ArenaBoard;
-
-/// `guild\gil_list_frame.ddj` -> `media://interface/guild/gil_list_frame.ddj`.
-fn art_path(background: &str) -> String {
-    format!(
-        "{ART_ROOT}{}",
-        background.to_ascii_lowercase().replace('\\', "/")
-    )
-}
 
 /// The board's rows, top to bottom. Sorted by `y`, never by record index —
 /// the same trap `frpvp.2dt` documents.
@@ -312,14 +304,6 @@ impl Plugin for ArenaScoreboardPlugin {
 mod test {
     use super::*;
     use crate::plugins::hud::arena::ArenaScore;
-
-    #[test]
-    fn art_paths_are_media_relative_and_forward_slashed() {
-        assert_eq!(
-            art_path("guild\\gil_list_frame.ddj"),
-            "media://interface/guild/gil_list_frame.ddj"
-        );
-    }
 
     /// The rank number and the crest are not ours to fill: the first is the
     /// row's index in a list the server orders, the second has no verified

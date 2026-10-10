@@ -38,6 +38,7 @@
 //! `CNIFMiniConfirm` dialog (`res_ui/nifenchantalchemymsgbox.2dt`, root id 172),
 //! which the doc reads as shared and therefore not alchemy-local.
 
+use crate::plugins::hud::art::art_path;
 use bevy::prelude::*;
 use bevy::ui::UiTargetCamera;
 use bevy::ui_widgets::{Activate, Button};
@@ -49,7 +50,6 @@ use crate::plugins::textdata::ClientUiStrings;
 use crate::scenes::SceneState;
 
 const DESCRIPTOR: &str = "media://res_ui/nifenchantwnd.2dt";
-const ART_ROOT: &str = "media://interface/";
 /// The whole window frame is this one 376x376 DXT1 bitmap; the other seven
 /// `mframe_alc_` pieces are 4x4 stubs (doc §3).
 const PLATE_ART: &str = "media://interface/frame/mframe_alc_right_up.ddj";
@@ -157,12 +157,6 @@ pub struct EnchantWindow;
 struct EnchantTab(AlchemyVerb);
 
 /// `frame\mframe_alc_right_up.ddj` -> a media-relative asset path.
-fn art_path(background: &str) -> String {
-    format!(
-        "{ART_ROOT}{}",
-        background.to_ascii_lowercase().replace('\\', "/")
-    )
-}
 
 /// Anything laid out left to right is read **in coordinate order**, never in
 /// record order — the descriptor corpus reorders records freely
@@ -438,13 +432,5 @@ mod test {
         assert_eq!(state.verb.pane(), AlchemyPane::OneToMany);
         state.verb = AlchemyVerb::Strengthen;
         assert_eq!(state.verb.pane(), AlchemyPane::ItemPlusStones);
-    }
-
-    #[test]
-    fn art_paths_are_media_relative_and_forward_slashed() {
-        assert_eq!(
-            art_path("frame\\mframe_alc_right_up.ddj"),
-            "media://interface/frame/mframe_alc_right_up.ddj"
-        );
     }
 }
