@@ -22,6 +22,8 @@ table and the macro disagree, so coverage stays honest.
 > Direction is inferred from the opcode range/naming convention
 > (`0x2xxx`/`0x6xxx`/`0x7xxx` client→server; `0xAxxx`/`0xBxxx`/`0x3xxx`
 > server→client) and cross-checked against the macro's own section comments.
+> Where a capture contradicts the convention, **the capture wins** and the row says so —
+> `0x6005` is the measured exception so far.
 
 ## Handshake & global
 
@@ -30,7 +32,7 @@ table and the macro disagree, so coverage stays honest.
 | `0x2001` | ModuleIdentification | both | wired | first packet on every connection; `u16`-length-prefixed module name. C→S `SR_Client` + a trailing zero (static read of the original client); S→C the peer's own name, matched against `GatewayServer`/`AgentServer`/`DownloadServer` by `ModuleIdentification::peer_kind()`. The trailing byte is optional inbound — no S→C capture exists, it is read during connection setup before the dumping receive loop |
 | `0x2002` | KeepAlive | C→S | wired | 5s ping, empty body |
 | `0x2005` | GlobalStateUpdate | S→C | wired |  |
-| `0x6005` | GlobalStateRequest | C→S | wired | typed but not sent yet |
+| `0x6005` | GlobalStateRequest | S→C | wired | **inbound**, against the `0x6xxx` convention: 739 received frames in `packet_dump/0x6005.log` (body `0300020002`), none sent — there is no `packet_dump/c2s/0x6005.log` and no writer in the client, only the reader `on_global_state_request` (`client/src/plugins/net/plugin.rs:462`). The real server wraps it in the massive header `0x600d` (`inner=0x6005`). The `Request` in the name is ours and unverified; renaming it would have to move with `packets/src/lib.rs:147` |
 | `0x2113` | XTrapIdentification | both | wired | anti-cheat challenge/response, 1026 bytes both ways (`u8 kind`, `u8 sub`, `u8[0x400]`); the blob stays opaque, the body is kept whole, and nothing sends a reply |
 
 ## Login & gateway
