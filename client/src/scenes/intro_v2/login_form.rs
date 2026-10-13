@@ -1,5 +1,5 @@
 use bevy::app::AppExit;
-use bevy::input_focus::tab_navigation::TabGroup;
+use bevy::input_focus::tab_navigation::{TabGroup, TabIndex};
 use bevy::prelude::*;
 use bevy::ui_widgets::Activate;
 
@@ -132,6 +132,7 @@ pub fn login_form(assets: &IntroV2Assets, fonts: &FontAssets) -> impl Scene {
                     (
                         image_button(list_button_style(assets), 48.0, 24.0)
                         ServerListButton
+                        TabIndex(2)
                         ImageNode { color: Color::NONE }
                         Node { position_type: PositionType::Absolute, left: px(203), top: px(86), align_self: AlignSelf::FlexStart }
                         ButtonSound({button_sound.clone()})
@@ -163,6 +164,7 @@ pub fn login_form(assets: &IntroV2Assets, fonts: &FontAssets) -> impl Scene {
                     (
                         image_button(main_button_style(assets), 91.0, 41.0)
                         ConnectButton
+                        TabIndex(3)
                         ImageNode { color: Color::NONE }
                         ButtonSound({button_sound.clone()})
                         Children [ (label("Connect", font.clone(), 16.0)) ]
@@ -171,6 +173,7 @@ pub fn login_form(assets: &IntroV2Assets, fonts: &FontAssets) -> impl Scene {
                     (
                         image_button(main_button_style(assets), 91.0, 41.0)
                         ExitButton
+                        TabIndex(4)
                         ImageNode { color: Color::NONE }
                         ButtonSound({button_sound})
                         Children [ (label("Exit", font, 16.0)) ]

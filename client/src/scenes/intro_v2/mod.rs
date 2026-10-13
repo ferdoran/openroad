@@ -315,6 +315,7 @@ impl Plugin for IntroV2ScenePlugin {
                     net::on_gateway_login_response,
                     net::poll_agent_login,
                     net::on_agent_login_response,
+                    net::enter_presses_connect.run_if(in_state(IntroV2State::LoginForm)),
                     captcha::on_captcha_challenge,
                     captcha::on_captcha_confirm_response,
                 )
